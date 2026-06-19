@@ -346,15 +346,15 @@ with col2:
             <div style='display:flex;
             justify-content:space-between;
             padding:12px 0;
-            border-bottom:1px solid #E5E7EB;
+            border-bottom:1px solid var(--border-soft);
             flex-wrap:wrap;
             gap:8px;'>
 
-            <span style='font-weight:bold; color:black;'>
+            <span style='font-weight:bold; color: var(--text-primary);'>
             {row['Platform']}
             </span>
 
-            <span style='color:#666;'>
+            <span style='color: var(--text-secondary);'>
             SGD ${row['NAV']:,.2f} ({pct:.1f}%)
             </span>
 
@@ -462,7 +462,7 @@ with col2:
 
             <div style='display:flex;
             justify-content:space-between;
-            color:black;
+            color: var(--text-primary);
             font-weight:bold;
             margin-bottom:6px;
             flex-wrap:wrap;
@@ -478,7 +478,7 @@ with col2:
 
             </div>
 
-            <div style='color:#666666;
+            <div style='color: var(--text-secondary);
             margin-bottom:8px;'>
 
             SGD ${amount:,.2f}
@@ -559,7 +559,7 @@ if len(index_etf_positions) > 0:
 
                 <div style='display:flex;
                 justify-content:space-between;
-                color:black;
+                color: var(--text-primary);
                 font-weight:bold;
                 margin-bottom:6px;
                 flex-wrap:wrap;
@@ -575,7 +575,7 @@ if len(index_etf_positions) > 0:
 
                 </div>
 
-                <div style='color:#666666;
+                <div style='color: var(--text-secondary);
                 margin-bottom:8px;'>
 
                 SGD ${value_sgd:,.2f}
@@ -606,11 +606,11 @@ if len(index_etf_positions) > 0:
             flex-wrap:wrap;
             gap:8px;'>
 
-            <span style='font-weight:bold; color:black; font-size:18px;'>
+            <span style='font-weight:bold; color: var(--text-primary); font-size:18px;'>
             Total
             </span>
 
-            <span style='font-weight:bold; color:black; font-size:18px;'>
+            <span style='font-weight:bold; color: var(--text-primary); font-size:18px;'>
             SGD ${etf_total_sgd:,.2f}
             </span>
 
@@ -679,7 +679,7 @@ if len(stock_positions) > 0:
 
                 <div style='display:flex;
                 justify-content:space-between;
-                color:black;
+                color: var(--text-primary);
                 font-weight:bold;
                 margin-bottom:6px;
                 flex-wrap:wrap;
@@ -695,7 +695,7 @@ if len(stock_positions) > 0:
 
                 </div>
 
-                <div style='color:#666666;
+                <div style='color: var(--text-secondary);
                 margin-bottom:8px;'>
 
                 SGD ${value_sgd:,.2f}
@@ -726,11 +726,11 @@ if len(stock_positions) > 0:
             flex-wrap:wrap;
             gap:8px;'>
 
-            <span style='font-weight:bold; color:black; font-size:18px;'>
+            <span style='font-weight:bold; color: var(--text-primary); font-size:18px;'>
             Total
             </span>
 
-            <span style='font-weight:bold; color:black; font-size:18px;'>
+            <span style='font-weight:bold; color: var(--text-primary); font-size:18px;'>
             SGD ${stock_total_sgd:,.2f}
             </span>
 
@@ -820,7 +820,7 @@ if len(option_positions) > 0:
 
                 <div style='display:flex;
                 justify-content:space-between;
-                color:black;
+                color: var(--text-primary);
                 font-weight:bold;
                 margin-bottom:6px;
                 flex-wrap:wrap;
@@ -836,7 +836,7 @@ if len(option_positions) > 0:
 
                 </div>
 
-                <div style='color:#666666;
+                <div style='color: var(--text-secondary);
                 margin-bottom:8px;'>
 
                 SGD ${exposure_sgd:,.2f}
@@ -869,11 +869,11 @@ if len(option_positions) > 0:
             flex-wrap:wrap;
             gap:8px;'>
 
-            <span style='font-weight:bold; color:black; font-size:18px;'>
+            <span style='font-weight:bold; color: var(--text-primary); font-size:18px;'>
             Total
             </span>
 
-            <span style='font-weight:bold; color:black; font-size:18px;'>
+            <span style='font-weight:bold; color: var(--text-primary); font-size:18px;'>
             SGD ${option_total_sgd:,.2f}
             </span>
 
@@ -938,15 +938,15 @@ with col2:
             <div style='display:flex;
             justify-content:space-between;
             padding:12px 0;
-            border-bottom:1px solid #E5E7EB;
+            border-bottom:1px solid var(--border-soft);
             flex-wrap:wrap;
             gap:8px;'>
 
-            <span style='font-weight:bold; color:black;'>
+            <span style='font-weight:bold; color: var(--text-primary);'>
             {c['Platform']}
             </span>
 
-            <span style='color:#666;'>
+            <span style='color: var(--text-secondary);'>
             SGD ${c['Cash']:,.2f} ({pct:.1f}%)
             </span>
 
@@ -965,11 +965,11 @@ with col2:
         flex-wrap:wrap;
         gap:8px;'>
 
-        <span style='font-weight:bold; color:black; font-size:18px;'>
+        <span style='font-weight:bold; color: var(--text-primary); font-size:18px;'>
         Total Cash
         </span>
 
-        <span style='font-weight:bold; color:black; font-size:18px;'>
+        <span style='font-weight:bold; color: var(--text-primary); font-size:18px;'>
         SGD ${total_cash:,.2f} ({total_cash_pct:.1f}%)
         </span>
 
@@ -988,7 +988,7 @@ with col2:
 
         <div style='display:flex;
         justify-content:space-between;
-        color:black;
+        color: var(--text-primary);
         font-weight:bold;
         margin-bottom:6px;
         flex-wrap:wrap;

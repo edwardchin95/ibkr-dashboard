@@ -10,7 +10,7 @@ st.set_page_config(
 # ============================================================
 # Constants
 # ============================================================
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "Welcome#123")
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "changeme")
 
 if os.path.exists("/mnt/data"):
     DATA_DIR = "/mnt/data"
@@ -61,10 +61,37 @@ def check_password():
             st.stop()
 
 def require_auth():
-    """子页面调用这个 — 只检查状态，不显示密码框"""
-    if not st.session_state.get("authenticated", False):
-        st.warning("⚠️ 请先登录")
-        st.stop()
+    """子页面调用 — 未登录时显示密码框（不再要求跳 app 页）"""
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if st.session_state["authenticated"]:
+        return True
+
+    # 未登录 → 显示全屏密码框
+    st.markdown("""
+    <style>
+    [data-testid="stSidebar"] { display: none; }
+    header { display: none; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        st.markdown("<div style='height:20vh'></div>", unsafe_allow_html=True)
+        st.markdown("## 📊 Portfolio Dashboard")
+        st.markdown("---")
+        password = st.text_input("🔒 请输入密码", type="password", key="auth_pw_input")
+
+        if password == "":
+            st.stop()
+
+        if password == DASHBOARD_PASSWORD:
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("密码错误")
+            st.stop()
 
 # ============================================================
 # CSS
@@ -77,21 +104,62 @@ def load_css():
         display: none;
     }
 
-    .main {
-        background-color: #F5F7FB;
+    /* ============================================================
+       默认（Light Mode）变量
+       ============================================================ */
+    :root {
+        --text-primary: #111827;
+        --text-secondary: #666666;
+        --text-muted: #9CA3AF;
+        --border-soft: #E5E7EB;
+        --border-strong: #333333;
+        --page-bg: #F5F7FB;
     }
 
+    /* ============================================================
+       Dark Mode 自动覆盖
+       ============================================================ */
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --text-primary: #FAFAFA;
+            --text-secondary: #C0C0C0;
+            --text-muted: #9CA3AF;
+            --border-soft: #333333;
+            --border-strong: #555555;
+            --page-bg: #0E1117;
+        }
+    }
+
+    /* Streamlit 自己的 dark mode class（手动切换时也生效）*/
+    [data-theme="dark"] {
+        --text-primary: #FAFAFA;
+        --text-secondary: #C0C0C0;
+        --text-muted: #9CA3AF;
+        --border-soft: #333333;
+        --border-strong: #555555;
+        --page-bg: #0E1117;
+    }
+
+    /* ============================================================
+       全局
+       ============================================================ */
+    .main {
+        background-color: var(--page-bg);
+    }
+
+    /* Card 一律深色（你 dashboard 视觉风格）*/
     .card {
         background-color: #111827;
         padding: 24px;
         border-radius: 16px;
         margin-bottom: 24px;
+        color: #FAFAFA;
     }
 
     .big-number {
         font-size: 42px;
         font-weight: bold;
-        color: white;
+        color: #FAFAFA;
     }
 
     .green {
@@ -106,10 +174,11 @@ def load_css():
         font-weight: bold;
     }
 
+    /* Section title — 跟随主题 */
     .section-title {
         font-size: 28px;
         font-weight: bold;
-        color: black;
+        color: var(--text-primary);
         margin-top: 24px;
         margin-bottom: 20px;
     }
@@ -128,65 +197,21 @@ def load_css():
         border-radius: 10px;
     }
 
-    .metric-title {
-        color: black;
-        font-size: 16px;
-        font-weight: bold;
-    }
-
-    .metric-sub {
-        color: #666666;
-        font-size: 13px;
-    }
-
     /* ============================================================
-       响应式：手机模式
+       响应式
        ============================================================ */
     @media (max-width: 640px) {
-
-        .card {
-            padding: 16px !important;
-            border-radius: 12px !important;
-            margin-bottom: 16px !important;
-        }
-
-        .big-number {
-            font-size: 28px !important;
-        }
-
-        .section-title {
-            font-size: 20px !important;
-            margin-top: 16px !important;
-            margin-bottom: 12px !important;
-        }
-
-        .green, .red {
-            font-size: 18px !important;
-        }
-
-        /* 让所有内联 grid 卡片在手机自动缩小 minmax */
-        div[style*="grid-template-columns"] {
-            gap: 14px !important;
-        }
-
-        /* flex 内的 span 在手机不会撑爆 */
-        div[style*="display:flex"] > span {
-            word-break: break-word;
-        }
+        .card { padding: 16px !important; border-radius: 12px !important; margin-bottom: 16px !important; }
+        .big-number { font-size: 28px !important; }
+        .section-title { font-size: 20px !important; margin-top: 16px !important; margin-bottom: 12px !important; }
+        .green, .red { font-size: 18px !important; }
+        div[style*="grid-template-columns"] { gap: 14px !important; }
+        div[style*="display:flex"] > span { word-break: break-word; }
     }
 
-    /* ============================================================
-       响应式：平板模式
-       ============================================================ */
     @media (min-width: 641px) and (max-width: 1024px) {
-
-        .big-number {
-            font-size: 34px !important;
-        }
-
-        .section-title {
-            font-size: 24px !important;
-        }
+        .big-number { font-size: 34px !important; }
+        .section-title { font-size: 24px !important; }
     }
 
     </style>""", unsafe_allow_html=True)

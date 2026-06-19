@@ -553,7 +553,17 @@ def analyze_positions(df_positions, total_nav, cash_sgd):
 
             try:
                 if expiry_str and expiry_str.lower() != "nan":
-                    expiry_date = datetime.strptime(expiry_str, "%Y%m%d")
+                    es = expiry_str.strip()
+
+                    # 防止 pandas 把 260717 读成 float "260717.0"
+                    if "." in es:
+                        es = es.split(".")[0]
+
+                    # 6 位 YYMMDD → 8 位 YYYYMMDD
+                    if len(es) == 6:
+                        es = "20" + es
+
+                    expiry_date = datetime.strptime(es, "%Y%m%d")
                     days_to_expiry = (expiry_date - datetime.now()).days
             except:
                 days_to_expiry = None
