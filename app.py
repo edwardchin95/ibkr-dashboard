@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import pandas as pd
 
 st.set_page_config(
     page_title="Portfolio Dashboard",
@@ -10,7 +11,7 @@ st.set_page_config(
 # ============================================================
 # Constants
 # ============================================================
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "changeme")
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "Welcome#123")
 
 if os.path.exists("/mnt/data"):
     DATA_DIR = "/mnt/data"
@@ -104,62 +105,21 @@ def load_css():
         display: none;
     }
 
-    /* ============================================================
-       默认（Light Mode）变量
-       ============================================================ */
-    :root {
-        --text-primary: #111827;
-        --text-secondary: #666666;
-        --text-muted: #9CA3AF;
-        --border-soft: #E5E7EB;
-        --border-strong: #333333;
-        --page-bg: #F5F7FB;
-    }
-
-    /* ============================================================
-       Dark Mode 自动覆盖
-       ============================================================ */
-    @media (prefers-color-scheme: dark) {
-        :root {
-            --text-primary: #FAFAFA;
-            --text-secondary: #C0C0C0;
-            --text-muted: #9CA3AF;
-            --border-soft: #333333;
-            --border-strong: #555555;
-            --page-bg: #0E1117;
-        }
-    }
-
-    /* Streamlit 自己的 dark mode class（手动切换时也生效）*/
-    [data-theme="dark"] {
-        --text-primary: #FAFAFA;
-        --text-secondary: #C0C0C0;
-        --text-muted: #9CA3AF;
-        --border-soft: #333333;
-        --border-strong: #555555;
-        --page-bg: #0E1117;
-    }
-
-    /* ============================================================
-       全局
-       ============================================================ */
     .main {
-        background-color: var(--page-bg);
+        background-color: #F5F7FB;
     }
 
-    /* Card 一律深色（你 dashboard 视觉风格）*/
     .card {
         background-color: #111827;
         padding: 24px;
         border-radius: 16px;
         margin-bottom: 24px;
-        color: #FAFAFA;
     }
 
     .big-number {
         font-size: 42px;
         font-weight: bold;
-        color: #FAFAFA;
+        color: white;
     }
 
     .green {
@@ -174,11 +134,10 @@ def load_css():
         font-weight: bold;
     }
 
-    /* Section title — 跟随主题 */
     .section-title {
         font-size: 28px;
         font-weight: bold;
-        color: var(--text-primary);
+        color: black;
         margin-top: 24px;
         margin-bottom: 20px;
     }
@@ -197,33 +156,128 @@ def load_css():
         border-radius: 10px;
     }
 
-    /* ============================================================
-       响应式
-       ============================================================ */
-    @media (max-width: 640px) {
-        .card { padding: 16px !important; border-radius: 12px !important; margin-bottom: 16px !important; }
-        .big-number { font-size: 28px !important; }
-        .section-title { font-size: 20px !important; margin-top: 16px !important; margin-bottom: 12px !important; }
-        .green, .red { font-size: 18px !important; }
-        div[style*="grid-template-columns"] { gap: 14px !important; }
-        div[style*="display:flex"] > span { word-break: break-word; }
+    .metric-title {
+        color: black;
+        font-size: 16px;
+        font-weight: bold;
     }
 
+    .metric-sub {
+        color: #666666;
+        font-size: 13px;
+    }
+
+    /* ============================================================
+       响应式：手机模式
+       ============================================================ */
+    @media (max-width: 640px) {
+
+        .card {
+            padding: 16px !important;
+            border-radius: 12px !important;
+            margin-bottom: 16px !important;
+        }
+
+        .big-number {
+            font-size: 28px !important;
+        }
+
+        .section-title {
+            font-size: 20px !important;
+            margin-top: 16px !important;
+            margin-bottom: 12px !important;
+        }
+
+        .green, .red {
+            font-size: 18px !important;
+        }
+
+        /* 让所有内联 grid 卡片在手机自动缩小 minmax */
+        div[style*="grid-template-columns"] {
+            gap: 14px !important;
+        }
+
+        /* flex 内的 span 在手机不会撑爆 */
+        div[style*="display:flex"] > span {
+            word-break: break-word;
+        }
+    }
+
+    /* ============================================================
+       响应式：平板模式
+       ============================================================ */
     @media (min-width: 641px) and (max-width: 1024px) {
-        .big-number { font-size: 34px !important; }
-        .section-title { font-size: 24px !important; }
+
+        .big-number {
+            font-size: 34px !important;
+        }
+
+        .section-title {
+            font-size: 24px !important;
+        }
     }
 
     </style>""", unsafe_allow_html=True)
+# ============================================================
+# Helper: 格式化 dataframe 显示
+# ============================================================
+def format_df(df, cols_2dp=None, cols_3dp=None, date_cols=None):
+    """
+    Format dataframe for display.
+    - cols_2dp: round to 2 decimals
+    - cols_3dp: round to 3 decimals  
+    - date_cols: normalize date columns (handles YYYYMMDD and "2026-05-26 09:31:33,")
+    """
+    out = df.copy()
 
+    if date_cols:
+        if isinstance(date_cols, str):
+            date_cols = [date_cols]
+        for c in date_cols:
+            if c in out.columns:
+                def _fmt(s):
+                    s = str(s).strip().rstrip(",").strip()
+                    if len(s) == 8 and s.isdigit():
+                        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+                    if " " in s:
+                        s = s.split(" ")[0]
+                    return s
+                out[c] = out[c].apply(_fmt)
+
+    if cols_2dp:
+        for c in cols_2dp:
+            if c in out.columns:
+                out[c] = pd.to_numeric(out[c], errors="coerce").round(2)
+
+    if cols_3dp:
+        for c in cols_3dp:
+            if c in out.columns:
+                out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
+
+    return out
 # ============================================================
 # Detect Platform
 # ============================================================
 def detect_platform(file_bytes):
+    """
+    自动识别 CSV 来自哪个 broker。
+    Return: "IBKR" / "Tiger" / None
+    """
     if isinstance(file_bytes, str):
         file_bytes = file_bytes.encode("utf-8")
+
+    # ---- Tiger 检测 ----
+    # Tiger Activity Statement 特征：包含 "Tiger Brokers" 或 "Activity Statement"
+    # + Account Overview + Holdings 两个 section
+    if b"Tiger Brokers" in file_bytes or b"Activity Statement" in file_bytes:
+        if b"Account Overview" in file_bytes and b"Holdings" in file_bytes:
+            return "Tiger"
+
+    # ---- IBKR 检测 ----
+    # IBKR Flex Query 特征：有 AssetClass 列名 或 ClientAccountID
     if b'"AssetClass"' in file_bytes or b"ClientAccountID" in file_bytes:
         return "IBKR"
+
     return None
 
 # ============================================================
