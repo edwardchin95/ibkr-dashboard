@@ -1,6 +1,8 @@
 import streamlit as st
 import os
+import re
 import pandas as pd
+from datetime import datetime, timedelta
 
 st.set_page_config(
     page_title="Portfolio Dashboard",
@@ -24,6 +26,67 @@ INCOMING_DIR = os.path.join(DATA_DIR, "incoming")
 
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 os.makedirs(INCOMING_DIR, exist_ok=True)
+
+
+# ============================================================
+# UNIFIED CONSTANTS (shared by IBKR / Tiger / Moomoo)
+# ============================================================
+
+TRADES_HISTORY_FILE = os.path.join(DATA_DIR, "trades_history.csv")
+
+INDEX_ETFS = ["CSPX", "VOO", "VT", "QQQ", "QQQM", "BNDW", "SPY", "DIA", "IWM"]
+
+TARGET_ETF_STOCK_TOTAL = 60
+TARGET_SINGLE_STOCK = 10
+TARGET_OPTION_TOTAL = 20
+TARGET_CASH = 20
+
+OPTION_TARGETS = {
+    "Sell Put": 40, "Sell Call": 40, "LEAPS Call": 20,
+    "Long Call": 10, "Long Put": 10, "Other Options": 0
+}
+
+OPTION_COLORS = {
+    "Sell Put": "#4A7BFF", "Sell Call": "#00D4FF", "LEAPS Call": "#FFC300",
+    "Long Call": "#00D4AA", "Long Put": "#FF6666", "Other Options": "#9CA3AF"
+}
+
+OPTION_MULTIPLIER = 100
+
+DEFAULT_USDSGD = 1.34
+DEFAULT_HKDSGD = 0.17
+
+
+# ============================================================
+# UNIFIED SCHEMA
+# ============================================================
+
+UNIFIED_POSITIONS_COLS = [
+    "Platform", "Symbol", "Description", "AssetClass", "Currency",
+    "Quantity", "Multiplier", "CostPrice", "ClosePrice",
+    "PositionValue", "PositionValueSgd",
+    "UnrealizedPnL", "UnrealizedPnLSgd",
+    "UnderlyingSymbol", "Put/Call", "Strike", "Expiry", "DTE",
+]
+
+UNIFIED_TRADES_COLS = [
+    "Platform", "TradeDate", "Symbol", "Description", "AssetClass",
+    "Buy/Sell", "Quantity", "TradePrice", "Currency",
+    "Strategy", "Notes",
+    "NetCash", "Commission",
+    "RealizedPnL", "RealizedPnLSgd", "UsdToSgd",
+]
+
+JOURNAL_COLS = ["Strategy", "Notes"]
+
+UNIFIED_HISTORY_COLS = [
+    "Platform", "Timestamp", "SnapshotFile",
+    "NAV", "Cash", "PnL",
+    "TotalDeposit", "PeriodDeposit",
+    "Dividends", "WithholdingTax", "NetDividends", "Fees",
+    "UsdToSgd",
+]
+
 
 # ============================================================
 # PASSWORD — 全屏覆盖
@@ -261,10 +324,14 @@ def format_df(df, cols_2dp=None, cols_3dp=None, date_cols=None):
 def detect_platform(file_bytes):
     """
     自动识别 CSV 来自哪个 broker。
-    Return: "IBKR" / "Tiger" / None
+    Return: "IBKR" / "Tiger" / "Moomoo" / None
     """
     if isinstance(file_bytes, str):
         file_bytes = file_bytes.encode("utf-8")
+
+    # ---- Moomoo 检测 ----
+    if b"Moomoo Statement" in file_bytes:
+        return "Moomoo"
 
     # ---- Tiger 检测 ----
     # Tiger Activity Statement 特征：包含 "Tiger Brokers" 或 "Activity Statement"
@@ -279,6 +346,153 @@ def detect_platform(file_bytes):
         return "IBKR"
 
     return None
+
+
+# ============================================================
+# COVERAGE / GAP DETECTION
+# (Reads from portfolio_history.csv SnapshotFile names)
+# Shared by IBKR / Tiger / Moomoo pages
+# ============================================================
+
+def _extract_dates_from_filename(snapshot_file):
+    """
+    Extract (start_dt, end_dt) from filenames like:
+      moomoo_statement(20250627-20260627).csv
+      ibkr_statement(20250101-20251231).csv
+      tiger_statement(20250101-20251231).csv
+    """
+    s = str(snapshot_file)
+    m = re.search(r"\((\d{8})\s*-\s*(\d{8})\)", s)
+    if not m:
+        return None, None
+
+    try:
+        sd = datetime.strptime(m.group(1), "%Y%m%d")
+        ed = datetime.strptime(m.group(2), "%Y%m%d")
+        return sd, ed
+    except:
+        return None, None
+
+
+def detect_coverage_gaps(platform):
+    """
+    Detect gaps in statement coverage by reading SnapshotFile names
+    from portfolio_history.csv.
+
+    Returns:
+      {
+        "ranges":   [(start, end), ...],
+        "gaps":     [(gap_start, gap_end), ...],
+        "overlaps": [(a, b), ...],
+        "total_days":   int,
+        "covered_days": int,
+      }
+    """
+    result = {
+        "ranges": [],
+        "gaps": [],
+        "overlaps": [],
+        "total_days": 0,
+        "covered_days": 0,
+    }
+
+    if not os.path.exists(HISTORY_FILE):
+        return result
+
+    try:
+        df = pd.read_csv(HISTORY_FILE)
+    except:
+        return result
+
+    if df.empty or "Platform" not in df.columns or "SnapshotFile" not in df.columns:
+        return result
+
+    df = df[df["Platform"] == platform]
+    if df.empty:
+        return result
+
+    ranges = []
+    for _, row in df.iterrows():
+        sd, ed = _extract_dates_from_filename(row["SnapshotFile"])
+        if sd is not None and ed is not None:
+            ranges.append((sd, ed))
+
+    if not ranges:
+        return result
+
+    ranges.sort(key=lambda x: x[0])
+    result["ranges"] = [(s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d")) for s, e in ranges]
+
+    # Overlaps
+    for i in range(1, len(ranges)):
+        prev_s, prev_e = ranges[i - 1]
+        cur_s, cur_e = ranges[i]
+        if cur_s <= prev_e:
+            result["overlaps"].append(
+                (cur_s.strftime("%Y-%m-%d"), min(prev_e, cur_e).strftime("%Y-%m-%d"))
+            )
+
+    # Merge ranges
+    merged = []
+    for s, e in ranges:
+        if not merged:
+            merged.append([s, e])
+        else:
+            last_s, last_e = merged[-1]
+            if s <= last_e + timedelta(days=1):
+                merged[-1][1] = max(last_e, e)
+            else:
+                merged.append([s, e])
+
+    # Gaps between merged ranges
+    for i in range(1, len(merged)):
+        gap_start = merged[i - 1][1] + timedelta(days=1)
+        gap_end = merged[i][0] - timedelta(days=1)
+        if gap_start <= gap_end:
+            result["gaps"].append(
+                (gap_start.strftime("%Y-%m-%d"), gap_end.strftime("%Y-%m-%d"))
+            )
+
+    overall_start = merged[0][0]
+    overall_end = merged[-1][1]
+    total_days = (overall_end - overall_start).days + 1
+
+    covered_days = 0
+    for s, e in merged:
+        covered_days += (e - s).days + 1
+
+    result["total_days"] = total_days
+    result["covered_days"] = covered_days
+
+    return result
+
+
+def get_coverage_summary(platform):
+    """Human-readable summary for dashboard display."""
+    info = detect_coverage_gaps(platform)
+    lines = []
+
+    if not info["ranges"]:
+        return f"⚠️ 没有 {platform} statement coverage 记录。"
+
+    lines.append(f"📅 {platform} 已上传 {len(info['ranges'])} 份 statement")
+    lines.append(f"   覆盖 {info['covered_days']} / {info['total_days']} 天")
+
+    if info["gaps"]:
+        lines.append(f"\n⚠️ 检测到 {len(info['gaps'])} 个日期缺口：")
+        for gs, ge in info["gaps"]:
+            lines.append(f"   • {gs} → {ge}")
+        lines.append("\n👉 建议补一份覆盖这段时间的 statement，否则 FIFO 可能不准。")
+    else:
+        lines.append("✅ 没有日期缺口，FIFO 计算可信。")
+
+    if info["overlaps"]:
+        lines.append(f"\nℹ️ 有 {len(info['overlaps'])} 个重叠区间（不影响，已去重）：")
+        for os_, oe in info["overlaps"][:5]:
+            lines.append(f"   • {os_} → {oe}")
+
+    return "\n".join(lines)
+
 
 # ============================================================
 # 主入口 — 登录后跳转 Overview

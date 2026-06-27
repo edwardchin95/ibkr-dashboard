@@ -3,71 +3,25 @@ import io
 import os
 from datetime import datetime
 
-from app import SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR
+from app import (
+    SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR,
+    TRADES_HISTORY_FILE,
+    INDEX_ETFS,
+    TARGET_ETF_STOCK_TOTAL, TARGET_SINGLE_STOCK,
+    TARGET_OPTION_TOTAL, TARGET_CASH,
+    OPTION_TARGETS, OPTION_COLORS,
+    UNIFIED_POSITIONS_COLS, UNIFIED_TRADES_COLS,
+    JOURNAL_COLS, UNIFIED_HISTORY_COLS,
+)
+
 
 # ============================================================
-# Constants
+# IBKR-specific Constants
 # ============================================================
 
 IBKR_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "ibkr")
 os.makedirs(IBKR_SNAPSHOT_DIR, exist_ok=True)
 
-TRADES_HISTORY_FILE = os.path.join(
-    os.path.dirname(HISTORY_FILE),
-    "ibkr_trades_history.csv"
-)
-
-INDEX_ETFS = ["CSPX", "VOO", "VT", "QQQ", "QQQM", "BNDW"]
-
-TARGET_ETF_STOCK_TOTAL = 60
-TARGET_SINGLE_STOCK = 10
-TARGET_OPTION_TOTAL = 20
-TARGET_CASH = 20
-
-OPTION_TARGETS = {
-    "Sell Put": 40,
-    "Sell Call": 40,
-    "LEAPS Call": 20,
-    "Long Call": 10,
-    "Long Put": 10,
-    "Other Options": 0
-}
-
-OPTION_COLORS = {
-    "Sell Put": "#4A7BFF",
-    "Sell Call": "#00D4FF",
-    "LEAPS Call": "#FFC300",
-    "Long Call": "#00D4AA",
-    "Long Put": "#FF6666",
-    "Other Options": "#9CA3AF"
-}
-
-# ============================================================
-# Unified Schema
-# ============================================================
-
-UNIFIED_POSITIONS_COLS = [
-    "Platform", "Symbol", "Description", "AssetClass", "Currency",
-    "Quantity", "Multiplier", "CostPrice", "ClosePrice",
-    "PositionValue", "PositionValueSgd",
-    "UnrealizedPnL", "UnrealizedPnLSgd",
-    "UnderlyingSymbol", "Put/Call", "Strike", "Expiry", "DTE",
-]
-
-UNIFIED_TRADES_COLS = [
-    "Platform", "TradeDate", "Symbol", "Description", "AssetClass",
-    "Buy/Sell", "Quantity", "TradePrice", "Currency",
-    "NetCash", "Commission",
-    "RealizedPnL", "RealizedPnLSgd", "UsdToSgd",
-]
-
-UNIFIED_HISTORY_COLS = [
-    "Platform", "Timestamp", "SnapshotFile",
-    "NAV", "Cash", "PnL",
-    "TotalDeposit", "PeriodDeposit",
-    "Dividends", "WithholdingTax", "NetDividends", "Fees",
-    "UsdToSgd",
-]
 
 # ============================================================
 # Detect
@@ -91,6 +45,9 @@ def detect_ibkr_csv(file_obj_or_bytes):
                 text = raw
 
         if "Tiger Brokers" in text:
+            return False
+
+        if "Moomoo Statement" in text:
             return False
 
         if '"AssetClass"' in text and "ClientAccountID" in text:
@@ -127,6 +84,22 @@ def _safe_float(value, default=0):
         return float(value)
     except:
         return default
+
+
+def _format_trade_date(value):
+    """
+    IBKR TradeDate is usually YYYYMMDD.
+    Convert to YYYY-MM-DD for consistency.
+    """
+    s = str(value).strip()
+
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+
+    if " " in s:
+        return s.split(" ")[0]
+
+    return s
 
 
 # ============================================================
@@ -403,9 +376,12 @@ def parse_ibkr_csv(file_obj):
 
     keep = [c for c in UNIFIED_POSITIONS_COLS if c in result.columns]
     return result[keep]
+
+
 # ============================================================
 # SAVE SNAPSHOT + HISTORY
 # ============================================================
+
 def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
     upload_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -502,6 +478,7 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
     save_trades_history(uploaded_file, fx_ratio=fx_ratio)
 
     return history_df
+
 
 # ============================================================
 # LOAD LATEST SNAPSHOT
@@ -677,6 +654,7 @@ def process_incoming():
         )
 
     history_df.to_csv(HISTORY_FILE, index=False)
+
 
 # ============================================================
 # ANALYZE POSITIONS (uses PositionValueSgd directly)
@@ -856,7 +834,9 @@ def parse_trades(file_obj, fx_ratio=None):
 
     trades = []
     for _, row in df.iterrows():
-        trade_date = str(row.get("TradeDate", "")) if pd.notna(row.get("TradeDate", "")) else ""
+        trade_date_raw = str(row.get("TradeDate", "")) if pd.notna(row.get("TradeDate", "")) else ""
+        trade_date = _format_trade_date(trade_date_raw)
+
         symbol = str(row.get("Symbol", ""))
         description = str(row.get("Description", "")) if pd.notna(row.get("Description", "")) else ""
         asset_class = str(row.get("AssetClass", ""))
@@ -879,6 +859,8 @@ def parse_trades(file_obj, fx_ratio=None):
             "Quantity": quantity,
             "TradePrice": trade_price,
             "Currency": currency,
+            "Strategy": "",
+            "Notes": "",
             "NetCash": net_cash,
             "Commission": commission,
             "RealizedPnL": realized_pnl,
@@ -890,8 +872,11 @@ def parse_trades(file_obj, fx_ratio=None):
     if result.empty:
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
 
-    keep = [c for c in UNIFIED_TRADES_COLS if c in result.columns]
-    return result[keep]
+    for col in UNIFIED_TRADES_COLS:
+        if col not in result.columns:
+            result[col] = ""
+
+    return result[UNIFIED_TRADES_COLS]
 
 
 def save_trades_history(file_obj, fx_ratio=None):
@@ -905,10 +890,11 @@ def save_trades_history(file_obj, fx_ratio=None):
     if new_trades.empty:
         return load_trades_history()
 
-    key_cols = []
-    for col in ["TradeDate", "Symbol", "Buy/Sell", "Quantity", "TradePrice"]:
-        if col in new_trades.columns:
-            key_cols.append(col)
+    for col in UNIFIED_TRADES_COLS:
+        if col not in new_trades.columns:
+            new_trades[col] = ""
+
+    new_trades = new_trades[UNIFIED_TRADES_COLS]
 
     if os.path.exists(TRADES_HISTORY_FILE):
         try:
@@ -918,19 +904,94 @@ def save_trades_history(file_obj, fx_ratio=None):
     else:
         existing = pd.DataFrame()
 
-    new_trades_str = new_trades.astype(str).replace("nan", "")
+    if existing.empty:
+        combined = new_trades.copy()
 
-    if not existing.empty and len(key_cols) > 0:
-        combined = pd.concat([existing, new_trades_str], ignore_index=True)
-        combined = combined.drop_duplicates(subset=key_cols, keep="first")
-    else:
-        combined = pd.concat([existing, new_trades_str], ignore_index=True)
+        for col in JOURNAL_COLS:
+            if col not in combined.columns:
+                combined[col] = ""
+
+        combined = combined[UNIFIED_TRADES_COLS]
+
+        if "TradeDate" in combined.columns:
+            combined = combined.sort_values(
+                ["Platform", "TradeDate", "Symbol"],
+                ascending=[True, False, True]
+            )
+
+        combined.to_csv(TRADES_HISTORY_FILE, index=False)
+        return load_trades_history()
+
+    for col in UNIFIED_TRADES_COLS:
+        if col not in existing.columns:
+            existing[col] = ""
+
+    for col in JOURNAL_COLS:
+        if col not in existing.columns:
+            existing[col] = ""
+
+    existing = existing[UNIFIED_TRADES_COLS]
+
+    key_cols = [
+        "Platform",
+        "TradeDate",
+        "Symbol",
+        "Buy/Sell",
+        "Quantity",
+        "TradePrice",
+    ]
+
+    for col in key_cols:
+        if col not in existing.columns:
+            existing[col] = ""
+        if col not in new_trades.columns:
+            new_trades[col] = ""
+
+    existing_journal = existing[key_cols + JOURNAL_COLS].copy()
+    existing_journal = existing_journal.drop_duplicates(
+        subset=key_cols,
+        keep="last"
+    )
+
+    combined = pd.concat([existing, new_trades], ignore_index=True)
+
+    combined = combined.drop_duplicates(
+        subset=key_cols,
+        keep="last"
+    )
+
+    combined = combined.merge(
+        existing_journal,
+        on=key_cols,
+        how="left",
+        suffixes=("", "_old")
+    )
+
+    for col in JOURNAL_COLS:
+        old_col = f"{col}_old"
+
+        if old_col in combined.columns:
+            combined[col] = combined[col].combine_first(combined[old_col])
+            combined.drop(columns=[old_col], inplace=True, errors="ignore")
+
+        if col not in combined.columns:
+            combined[col] = ""
+
+    for col in UNIFIED_TRADES_COLS:
+        if col not in combined.columns:
+            combined[col] = ""
+
+    combined = combined[UNIFIED_TRADES_COLS]
 
     if "TradeDate" in combined.columns:
-        combined = combined.sort_values("TradeDate", ascending=False)
+        combined = combined.sort_values(
+            ["Platform", "TradeDate", "Symbol"],
+            ascending=[True, False, True]
+        )
 
     combined.to_csv(TRADES_HISTORY_FILE, index=False)
-    return combined
+
+    return load_trades_history()
 
 
 def load_trades_history():
@@ -938,9 +999,24 @@ def load_trades_history():
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
 
     try:
-        return pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
     except:
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
+
+    if df.empty:
+        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
+
+    for col in UNIFIED_TRADES_COLS:
+        if col not in df.columns:
+            df[col] = ""
+
+    if "Platform" in df.columns:
+        df = df[df["Platform"] == "IBKR"]
+
+    if df.empty:
+        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
+
+    return df[UNIFIED_TRADES_COLS]
 
 
 # ============================================================

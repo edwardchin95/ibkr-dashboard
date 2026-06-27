@@ -4,63 +4,28 @@ import os
 import csv
 from datetime import datetime
 
-from app import SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR
+from app import (
+    SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR,
+    TRADES_HISTORY_FILE,
+    INDEX_ETFS,
+    TARGET_ETF_STOCK_TOTAL, TARGET_SINGLE_STOCK,
+    TARGET_OPTION_TOTAL, TARGET_CASH,
+    OPTION_TARGETS, OPTION_COLORS,
+    UNIFIED_POSITIONS_COLS, UNIFIED_TRADES_COLS,
+    JOURNAL_COLS, UNIFIED_HISTORY_COLS,
+)
+
 
 # ============================================================
-# Constants
+# Tiger-specific Constants
 # ============================================================
 
 TIGER_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "tiger")
 os.makedirs(TIGER_SNAPSHOT_DIR, exist_ok=True)
 
-TIGER_TRADES_HISTORY_FILE = os.path.join(
-    os.path.dirname(HISTORY_FILE),
-    "tiger_trades_history.csv"
-)
+# Alias for backward compatibility
+TIGER_TRADES_HISTORY_FILE = TRADES_HISTORY_FILE
 
-INDEX_ETFS = ["CSPX", "VOO", "VT", "QQQ", "QQQM", "BNDW", "SPY", "DIA", "IWM"]
-
-TARGET_ETF_STOCK_TOTAL = 60
-TARGET_SINGLE_STOCK = 10
-TARGET_OPTION_TOTAL = 20
-TARGET_CASH = 20
-
-OPTION_TARGETS = {
-    "Sell Put": 40, "Sell Call": 40, "LEAPS Call": 20,
-    "Long Call": 10, "Long Put": 10, "Other Options": 0
-}
-
-OPTION_COLORS = {
-    "Sell Put": "#4A7BFF", "Sell Call": "#00D4FF", "LEAPS Call": "#FFC300",
-    "Long Call": "#00D4AA", "Long Put": "#FF6666", "Other Options": "#9CA3AF"
-}
-
-# ============================================================
-# Unified Schema
-# ============================================================
-
-UNIFIED_POSITIONS_COLS = [
-    "Platform", "Symbol", "Description", "AssetClass", "Currency",
-    "Quantity", "Multiplier", "CostPrice", "ClosePrice",
-    "PositionValue", "PositionValueSgd",
-    "UnrealizedPnL", "UnrealizedPnLSgd",
-    "UnderlyingSymbol", "Put/Call", "Strike", "Expiry", "DTE",
-]
-
-UNIFIED_TRADES_COLS = [
-    "Platform", "TradeDate", "Symbol", "Description", "AssetClass",
-    "Buy/Sell", "Quantity", "TradePrice", "Currency",
-    "NetCash", "Commission",
-    "RealizedPnL", "RealizedPnLSgd", "UsdToSgd",
-]
-
-UNIFIED_HISTORY_COLS = [
-    "Platform", "Timestamp", "SnapshotFile",
-    "NAV", "Cash", "PnL",
-    "TotalDeposit", "PeriodDeposit",
-    "Dividends", "WithholdingTax", "NetDividends", "Fees",
-    "UsdToSgd",
-]
 
 # ============================================================
 # Helpers
@@ -116,6 +81,8 @@ def _to_float(value, default=0):
 
 
 def _safe_get(row, idx, default=""):
+    if idx is None:
+        return default
     try:
         return row[idx]
     except:
@@ -175,17 +142,8 @@ def _calc_dte(expiry_str):
 def _activity_to_buy_sell(activity_type, quantity=None):
     """
     Tiger ActivityType + Quantity sign -> BUY/SELL.
-    
-    Tiger's terms: Open/OpenShort/Close/CloseShort
-    Mapping:
-      - Open / OpenLong (qty>0)    → BUY
-      - OpenShort (qty<0)          → SELL
-      - Close / CloseLong (qty<0)  → SELL
-      - CloseShort (qty>0)         → BUY
-    
-    Simplest rule: Quantity sign determines BUY/SELL.
+    Quantity sign is most reliable.
     """
-    # 优先用 Quantity 正负判断（最可靠）
     try:
         q = float(quantity)
         if q > 0:
@@ -195,16 +153,13 @@ def _activity_to_buy_sell(activity_type, quantity=None):
     except:
         pass
 
-    # Fallback：解析 ActivityType 文本
     at = str(activity_type).strip().upper()
 
-    # IBKR-style
     if "BUY" in at:
         return "BUY"
     if "SELL" in at:
         return "SELL"
 
-    # Tiger-style
     if "OPENSHORT" in at or "CLOSELONG" in at:
         return "SELL"
     if "OPEN" in at or "CLOSE" in at:
@@ -222,6 +177,7 @@ def _normalize_trade_date(trade_time):
         s = s.split(" ")[0]
     return s
 
+
 def detect_tiger_csv(file_obj_or_bytes):
     try:
         if isinstance(file_obj_or_bytes, bytes):
@@ -230,6 +186,9 @@ def detect_tiger_csv(file_obj_or_bytes):
             text = file_obj_or_bytes
         else:
             text = _read_text(file_obj_or_bytes)
+
+        if "Moomoo Statement" in text:
+            return False
 
         if "Activity Statement" in text and "Tiger Brokers" in text:
             return True
@@ -275,6 +234,18 @@ def _convert_to_base(amount, currency, fx_rates):
     currency = str(currency).strip()
     rate = fx_rates.get(currency, 1.0)
     return amount * rate
+
+
+def _to_sgd(amount, currency, usd_to_sgd, fx_rates):
+    """Convert any currency to SGD."""
+    currency = str(currency).strip().upper()
+    if currency == "SGD":
+        return amount
+    if currency == "USD":
+        return amount * usd_to_sgd
+    # Other currency: native -> USD base -> SGD
+    base = _convert_to_base(amount, currency, fx_rates)
+    return base * usd_to_sgd
 
 
 # ============================================================
@@ -337,14 +308,14 @@ def extract_nav_cash(file_obj):
 
 
 # ============================================================
-# EXTRACT NAV + CASH SGD (direct read approach)
+# EXTRACT NAV + CASH SGD
 # ============================================================
 
 def extract_nav_cash_sgd(file_obj):
     """
     SGD positions: direct from native
     USD positions: × usd_to_sgd
-    Cash: USD × usd_to_sgd
+    Cash: USD base × usd_to_sgd
     """
     file_obj.seek(0)
     usd_to_sgd = get_usd_to_sgd_rate(file_obj)
@@ -356,7 +327,6 @@ def extract_nav_cash_sgd(file_obj):
     df_positions = parse_tiger_csv(file_obj, usd_to_sgd=usd_to_sgd)
 
     if df_positions is None or df_positions.empty:
-        # Fallback
         file_obj.seek(0)
         total_nav_usd, _, stock_nav_usd, option_nav_usd = extract_nav_cash(file_obj)
         return {
@@ -534,19 +504,8 @@ def parse_tiger_csv(file_obj, usd_to_sgd=None):
         unrealized_native = _to_float(_safe_get(row, 10))
         currency = _safe_get(row, 13).strip()
 
-        # Compute SGD directly
-        if currency == "SGD":
-            value_sgd = value_native
-            unrealized_sgd = unrealized_native
-        elif currency == "USD":
-            value_sgd = value_native * usd_to_sgd
-            unrealized_sgd = unrealized_native * usd_to_sgd
-        else:
-            # Other currency: native -> USD base -> SGD
-            value_base = _convert_to_base(value_native, currency, fx_rates)
-            unrealized_base = _convert_to_base(unrealized_native, currency, fx_rates)
-            value_sgd = value_base * usd_to_sgd
-            unrealized_sgd = unrealized_base * usd_to_sgd
+        value_sgd = _to_sgd(value_native, currency, usd_to_sgd, fx_rates)
+        unrealized_sgd = _to_sgd(unrealized_native, currency, usd_to_sgd, fx_rates)
 
         if asset_type == "Option":
             option_info = _parse_option_description(description)
@@ -611,13 +570,332 @@ def parse_tiger_csv(file_obj, usd_to_sgd=None):
 
 
 # ============================================================
+# TRADES PARSER (Unified Schema)
+# ⭐ FIXED: multi-section header support
+# ============================================================
+
+def _is_trades_header_row(row):
+    """
+    Tiger has multiple Trades sections, each with its own header.
+    Header row pattern: row[0]=="Trades", row[3]=="" (not DATA/TOTAL),
+    and contains "Activity Type" or "Symbol".
+    """
+    if len(row) < 5:
+        return False
+    if _safe_get(row, 0) != "Trades":
+        return False
+    # Header rows have empty asset_type at [1]
+    if _safe_get(row, 1) != "":
+        return False
+    # Header rows don't have "DATA" or "TOTAL" at [3]
+    if _safe_get(row, 3) in ("DATA", "TOTAL"):
+        return False
+    # Must contain key column names
+    has_activity = "Activity Type" in row
+    has_symbol = any(s in row for s in ["Symbol", "Symbol(Base.Quote)"])
+    return has_activity and has_symbol
+
+
+def _build_idx_map(header):
+    """Build column index map from a header row."""
+    def find(name):
+        try:
+            return header.index(name)
+        except ValueError:
+            return None
+
+    return {
+        "Symbol": find("Symbol"),
+        "Symbol_Forex": find("Symbol(Base.Quote)"),
+        "Activity Type": find("Activity Type"),
+        "Quantity": find("Quantity"),
+        "Quantity_Forex": find("Quantity(Base)"),
+        "Trade Price": find("Trade Price"),
+        "Amount": find("Amount"),
+        "Amount_Forex": find("Amount(Quote)"),
+        "Commission": find("Commission"),
+        "Platform Fee": find("Platform Fee"),
+        "GST": find("GST"),
+        "Realized P/L": find("Realized P/L"),
+        "Trade Time": find("Trade Time"),
+        "Currency": find("Currency"),
+    }
+
+
+def parse_trades(file_obj, usd_to_sgd=None):
+    """
+    Parse Tiger trades from multiple section headers.
+
+    Tiger statement has 3 types of Trades sections:
+      1. Stock section (with "Accrued Interest in Trade" → 48 cols)
+      2. Option section (no "Accrued Interest" → 47 cols)
+      3. Forex section (USD.SGD换汇 → completely different 13 cols)
+
+    Each section has its own header row. We must track the current
+    section and use its own header to find column indices.
+
+    ⭐ Forex section is SKIPPED entirely (not real trades).
+    """
+    rows = _read_rows(file_obj)
+    fx_rates = extract_fx_rates(file_obj)
+
+    if usd_to_sgd is None:
+        file_obj.seek(0)
+        usd_to_sgd = get_usd_to_sgd_rate(file_obj)
+
+    trades = []
+
+    current_header = None
+    current_idx = None
+    current_section_type = None  # "Stock" / "Option" / "Forex" / None
+
+    for row in rows:
+        # ===== 1. Detect new Trades header row =====
+        if _is_trades_header_row(row):
+            current_header = row
+            current_idx = _build_idx_map(row)
+            # Detect section type by header columns
+            if "Symbol(Base.Quote)" in row:
+                current_section_type = "Forex"
+            else:
+                # Stock or Option — actual type depends on data rows
+                current_section_type = "StockOrOption"
+            continue
+
+        # ===== 2. Skip non-Trades rows =====
+        if _safe_get(row, 0) != "Trades":
+            continue
+
+        # ===== 3. Need a current header =====
+        if current_idx is None:
+            continue
+
+        # ===== 4. Get asset_type and row_type =====
+        asset_type = _safe_get(row, 1)
+        row_type = _safe_get(row, 3)
+
+        if row_type != "DATA":
+            continue
+
+        # ===== 5. Skip Forex (换汇 not a real trade) =====
+        if asset_type == "Forex":
+            continue
+
+        # Only process Stock / Option
+        if asset_type not in ("Stock", "Option"):
+            continue
+
+        # ===== 6. Extract Symbol/Description =====
+        description = _safe_get(row, current_idx.get("Symbol"))
+        if description == "":
+            # Tiger has duplicate rows where the second is blank — skip
+            continue
+
+        asset_class = "OPT" if asset_type == "Option" else "STK"
+
+        if asset_class == "OPT":
+            option_info = _parse_option_description(description)
+            symbol = option_info["Underlying"] if option_info["Underlying"] else description
+        else:
+            symbol = _parse_stock_symbol(description)
+
+        # ===== 7. Extract numeric / text fields =====
+        activity_type = _safe_get(row, current_idx.get("Activity Type"))
+        qty_raw = _safe_get(row, current_idx.get("Quantity"))
+        buy_sell = _activity_to_buy_sell(activity_type, quantity=qty_raw)
+
+        trade_time = _safe_get(row, current_idx.get("Trade Time"))
+        trade_date = _normalize_trade_date(trade_time)
+
+        quantity = _to_float(_safe_get(row, current_idx.get("Quantity")))
+        trade_price = _to_float(_safe_get(row, current_idx.get("Trade Price")))
+        currency = _safe_get(row, current_idx.get("Currency")) or "USD"
+        net_cash = _to_float(_safe_get(row, current_idx.get("Amount")))
+
+        commission = _to_float(_safe_get(row, current_idx.get("Commission")))
+        platform_fee = _to_float(_safe_get(row, current_idx.get("Platform Fee")))
+        gst = _to_float(_safe_get(row, current_idx.get("GST")))
+        total_commission = commission + platform_fee + gst
+
+        realized_pnl = _to_float(_safe_get(row, current_idx.get("Realized P/L")))
+        realized_pnl_sgd = _to_sgd(realized_pnl, currency, usd_to_sgd, fx_rates)
+
+        trades.append({
+            "Platform": "Tiger",
+            "TradeDate": trade_date,
+            "Symbol": symbol,
+            "Description": description,
+            "AssetClass": asset_class,
+            "Buy/Sell": buy_sell,
+            "Quantity": quantity,
+            "TradePrice": trade_price,
+            "Currency": currency,
+            "Strategy": "",
+            "Notes": "",
+            "NetCash": net_cash,
+            "Commission": total_commission,
+            "RealizedPnL": realized_pnl,
+            "RealizedPnLSgd": realized_pnl_sgd,
+            "UsdToSgd": usd_to_sgd,
+        })
+
+    df = pd.DataFrame(trades)
+    if df.empty:
+        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
+
+    for col in UNIFIED_TRADES_COLS:
+        if col not in df.columns:
+            df[col] = ""
+
+    return df[UNIFIED_TRADES_COLS]
+
+
+# ============================================================
+# SAVE TRADES HISTORY
+# ============================================================
+
+def save_trades_history(file_obj, usd_to_sgd=None):
+    file_obj.seek(0)
+    if usd_to_sgd is None:
+        usd_to_sgd = get_usd_to_sgd_rate(file_obj)
+        file_obj.seek(0)
+
+    new_trades = parse_trades(file_obj, usd_to_sgd=usd_to_sgd)
+
+    if new_trades.empty:
+        return load_trades_history()
+
+    for col in UNIFIED_TRADES_COLS:
+        if col not in new_trades.columns:
+            new_trades[col] = ""
+
+    new_trades = new_trades[UNIFIED_TRADES_COLS]
+
+    if os.path.exists(TRADES_HISTORY_FILE):
+        try:
+            existing = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        except:
+            existing = pd.DataFrame()
+    else:
+        existing = pd.DataFrame()
+
+    if existing.empty:
+        combined = new_trades.copy()
+
+        for col in JOURNAL_COLS:
+            if col not in combined.columns:
+                combined[col] = ""
+
+        combined = combined[UNIFIED_TRADES_COLS]
+
+        if "TradeDate" in combined.columns:
+            combined = combined.sort_values(
+                ["Platform", "TradeDate", "Symbol"],
+                ascending=[True, False, True]
+            )
+
+        combined.to_csv(TRADES_HISTORY_FILE, index=False)
+        return load_trades_history()
+
+    for col in UNIFIED_TRADES_COLS:
+        if col not in existing.columns:
+            existing[col] = ""
+
+    for col in JOURNAL_COLS:
+        if col not in existing.columns:
+            existing[col] = ""
+
+    existing = existing[UNIFIED_TRADES_COLS]
+
+    key_cols = [
+        "Platform",
+        "TradeDate",
+        "Symbol",
+        "Buy/Sell",
+        "Quantity",
+        "TradePrice",
+    ]
+
+    for col in key_cols:
+        if col not in existing.columns:
+            existing[col] = ""
+        if col not in new_trades.columns:
+            new_trades[col] = ""
+
+    existing_journal = existing[key_cols + JOURNAL_COLS].copy()
+    existing_journal = existing_journal.drop_duplicates(
+        subset=key_cols, keep="last"
+    )
+
+    combined = pd.concat([existing, new_trades], ignore_index=True)
+
+    combined = combined.drop_duplicates(
+        subset=key_cols, keep="last"
+    )
+
+    combined = combined.merge(
+        existing_journal,
+        on=key_cols,
+        how="left",
+        suffixes=("", "_old")
+    )
+
+    for col in JOURNAL_COLS:
+        old_col = f"{col}_old"
+        if old_col in combined.columns:
+            combined[col] = combined[col].combine_first(combined[old_col])
+            combined.drop(columns=[old_col], inplace=True, errors="ignore")
+        if col not in combined.columns:
+            combined[col] = ""
+
+    for col in UNIFIED_TRADES_COLS:
+        if col not in combined.columns:
+            combined[col] = ""
+
+    combined = combined[UNIFIED_TRADES_COLS]
+
+    if "TradeDate" in combined.columns:
+        combined = combined.sort_values(
+            ["Platform", "TradeDate", "Symbol"],
+            ascending=[True, False, True]
+        )
+
+    combined.to_csv(TRADES_HISTORY_FILE, index=False)
+
+    return load_trades_history()
+
+
+def load_trades_history():
+    if not os.path.exists(TRADES_HISTORY_FILE):
+        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
+
+    try:
+        df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+    except:
+        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
+
+    if df.empty:
+        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
+
+    for col in UNIFIED_TRADES_COLS:
+        if col not in df.columns:
+            df[col] = ""
+
+    if "Platform" in df.columns:
+        df = df[df["Platform"] == "Tiger"]
+
+    if df.empty:
+        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
+
+    return df[UNIFIED_TRADES_COLS]
+
+
+# ============================================================
 # SAVE SNAPSHOT + HISTORY
 # ============================================================
+
 def save_snapshot_and_history(uploaded_file, *_args):
-    """
-    Stores SGD values in history.
-    Ignores legacy USD args (passed in by Overview).
-    """
+    """Stores SGD values in history."""
     upload_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     original_name = uploaded_file.name
@@ -629,7 +907,6 @@ def save_snapshot_and_history(uploaded_file, *_args):
     uploaded_file.seek(0)
     usd_to_sgd = get_usd_to_sgd_rate(uploaded_file)
 
-    # === 新命名 + 真实日期 timestamp ===
     def _ymd(d):
         return str(d).replace("-", "") if d else ""
 
@@ -660,7 +937,6 @@ def save_snapshot_and_history(uploaded_file, *_args):
     with open(snapshot_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # Load unified history
     if os.path.exists(HISTORY_FILE):
         try:
             history_df = pd.read_csv(HISTORY_FILE)
@@ -669,7 +945,6 @@ def save_snapshot_and_history(uploaded_file, *_args):
     else:
         history_df = pd.DataFrame()
 
-    # Cumulative deposit (Tiger only)
     previous_total_deposit = 0
     if not history_df.empty:
         if "Platform" in history_df.columns:
@@ -715,6 +990,8 @@ def save_snapshot_and_history(uploaded_file, *_args):
     save_trades_history(uploaded_file, usd_to_sgd=usd_to_sgd)
 
     return history_df
+
+
 # ============================================================
 # LOAD LATEST SNAPSHOT
 # ============================================================
@@ -746,7 +1023,6 @@ def load_latest_snapshot():
     if not os.path.exists(snapshot_path):
         return None
 
-    # Read UsdToSgd from history
     usd_to_sgd = 1.34
     if "UsdToSgd" in history_df.columns:
         try:
@@ -782,6 +1058,7 @@ def load_latest_snapshot():
 # ============================================================
 # PROCESS INCOMING
 # ============================================================
+
 def process_incoming():
     if not os.path.exists(INCOMING_DIR):
         return
@@ -840,7 +1117,6 @@ def process_incoming():
         fees_usd = cash_summary.get("fees", 0)
         net_dividends_usd = cash_summary.get("net_dividends", dividends_usd + withholding_tax_usd)
 
-        # === 新命名 + 真实日期 timestamp ===
         def _ymd(d):
             return str(d).replace("-", "") if d else ""
 
@@ -890,6 +1166,8 @@ def process_incoming():
         )
 
     history_df.to_csv(HISTORY_FILE, index=False)
+
+
 # ============================================================
 # ANALYZE POSITIONS
 # ============================================================
@@ -1015,171 +1293,7 @@ def analyze_positions(df_positions, total_nav_sgd, cash_sgd):
 
 
 # ============================================================
-# TRADES PARSER (Unified Schema)
-# ============================================================
-
-def parse_trades(file_obj, usd_to_sgd=None):
-    rows = _read_rows(file_obj)
-
-    if usd_to_sgd is None:
-        file_obj.seek(0)
-        usd_to_sgd = get_usd_to_sgd_rate(file_obj)
-
-    header = None
-    for row in rows:
-        if (
-            len(row) > 10
-            and _safe_get(row, 0) == "Trades"
-            and "Activity Type" in row
-            and "Realized P/L" in row
-            and "Trade Time" in row
-        ):
-            header = row
-            break
-
-    if header is None:
-        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
-
-    def idx(name):
-        try:
-            return header.index(name)
-        except:
-            return None
-
-    idx_symbol = idx("Symbol")
-    idx_activity = idx("Activity Type")
-    idx_qty = idx("Quantity")
-    idx_price = idx("Trade Price")
-    idx_amount = idx("Amount")
-    idx_commission = idx("Commission")
-    idx_platform_fee = idx("Platform Fee")
-    idx_gst = idx("GST")
-    idx_realized = idx("Realized P/L")
-    idx_trade_time = idx("Trade Time")
-    idx_currency = idx("Currency")
-
-    trades = []
-
-    for row in rows:
-        if len(row) < 10:
-            continue
-        if _safe_get(row, 0) != "Trades":
-            continue
-
-        asset_type = _safe_get(row, 1)
-        row_type = _safe_get(row, 3)
-
-        if row_type != "DATA":
-            continue
-
-        description = _safe_get(row, idx_symbol) if idx_symbol is not None else ""
-        if description == "":
-            continue
-
-        asset_class = "OPT" if asset_type == "Option" else "STK"
-
-        if asset_class == "OPT":
-            option_info = _parse_option_description(description)
-            symbol = option_info["Underlying"] if option_info["Underlying"] else description
-        else:
-            symbol = _parse_stock_symbol(description)
-
-        activity_type = _safe_get(row, idx_activity) if idx_activity is not None else ""
-        qty_raw = _safe_get(row, idx_qty) if idx_qty is not None else 0
-        buy_sell = _activity_to_buy_sell(activity_type, quantity=qty_raw)
-
-        trade_time = _safe_get(row, idx_trade_time) if idx_trade_time is not None else ""
-        trade_date = _normalize_trade_date(trade_time)
-
-        quantity = _to_float(_safe_get(row, idx_qty)) if idx_qty is not None else 0
-        trade_price = _to_float(_safe_get(row, idx_price)) if idx_price is not None else 0
-        currency = _safe_get(row, idx_currency) if idx_currency is not None else "USD"
-        net_cash = _to_float(_safe_get(row, idx_amount)) if idx_amount is not None else 0
-
-        commission = _to_float(_safe_get(row, idx_commission)) if idx_commission is not None else 0
-        platform_fee = _to_float(_safe_get(row, idx_platform_fee)) if idx_platform_fee is not None else 0
-        gst = _to_float(_safe_get(row, idx_gst)) if idx_gst is not None else 0
-        total_commission = commission + platform_fee + gst
-
-        realized_pnl = _to_float(_safe_get(row, idx_realized)) if idx_realized is not None else 0
-        realized_pnl_sgd = realized_pnl * usd_to_sgd
-
-        trades.append({
-            "Platform": "Tiger",
-            "TradeDate": trade_date,
-            "Symbol": symbol,
-            "Description": description,
-            "AssetClass": asset_class,
-            "Buy/Sell": buy_sell,
-            "Quantity": quantity,
-            "TradePrice": trade_price,
-            "Currency": currency,
-            "NetCash": net_cash,
-            "Commission": total_commission,
-            "RealizedPnL": realized_pnl,
-            "RealizedPnLSgd": realized_pnl_sgd,
-            "UsdToSgd": usd_to_sgd,
-        })
-
-    df = pd.DataFrame(trades)
-    if df.empty:
-        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
-
-    keep = [c for c in UNIFIED_TRADES_COLS if c in df.columns]
-    return df[keep]
-
-
-def save_trades_history(file_obj, usd_to_sgd=None):
-    file_obj.seek(0)
-    if usd_to_sgd is None:
-        usd_to_sgd = get_usd_to_sgd_rate(file_obj)
-        file_obj.seek(0)
-
-    new_trades = parse_trades(file_obj, usd_to_sgd=usd_to_sgd)
-
-    if new_trades.empty:
-        return load_trades_history()
-
-    key_cols = []
-    for col in ["TradeDate", "Symbol", "Buy/Sell", "Quantity", "TradePrice"]:
-        if col in new_trades.columns:
-            key_cols.append(col)
-
-    if os.path.exists(TIGER_TRADES_HISTORY_FILE):
-        try:
-            existing = pd.read_csv(TIGER_TRADES_HISTORY_FILE, dtype=str)
-        except:
-            existing = pd.DataFrame()
-    else:
-        existing = pd.DataFrame()
-
-    new_trades_str = new_trades.astype(str).replace("nan", "")
-
-    if not existing.empty and len(key_cols) > 0:
-        combined = pd.concat([existing, new_trades_str], ignore_index=True)
-        combined = combined.drop_duplicates(subset=key_cols, keep="first")
-    else:
-        combined = pd.concat([existing, new_trades_str], ignore_index=True)
-
-    if "TradeDate" in combined.columns:
-        combined = combined.sort_values("TradeDate", ascending=False)
-
-    combined.to_csv(TIGER_TRADES_HISTORY_FILE, index=False)
-    return combined
-
-
-def load_trades_history():
-    if not os.path.exists(TIGER_TRADES_HISTORY_FILE):
-        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
-
-    try:
-        return pd.read_csv(TIGER_TRADES_HISTORY_FILE, dtype=str)
-    except:
-        return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
-
-
-# ============================================================
-# CASH SUMMARY TOTAL (SGD, from HISTORY_FILE Tiger rows)
+# CASH SUMMARY TOTAL (SGD)
 # ============================================================
 
 def load_cash_summary_total():
@@ -1237,7 +1351,6 @@ def load_realized_pnl_summary_sgd():
     if trades_df.empty:
         return {"realized_profit": 0, "realized_loss": 0, "realized_net": 0}
 
-    # Prefer SGD column
     if "RealizedPnLSgd" in trades_df.columns:
         col = "RealizedPnLSgd"
     elif "RealizedPnL" in trades_df.columns:

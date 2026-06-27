@@ -4,19 +4,19 @@ import plotly.graph_objects as go
 import os
 from datetime import datetime
 
-st.set_page_config(page_title="Tiger", page_icon="🐯", layout="wide")
+st.set_page_config(page_title="Moomoo", page_icon="🐮", layout="wide")
 
-from app import (
-    require_auth, load_css, HISTORY_FILE, format_df, DATA_DIR,
-    TRADES_HISTORY_FILE, OPTION_COLORS,
-    detect_coverage_gaps,
-)
+from app import require_auth, load_css, HISTORY_FILE, format_df, DATA_DIR
+TRADES_HISTORY_FILE = os.path.join(DATA_DIR, "trades_history.csv")
 
-from tiger import (
+from moomoo import (
     load_latest_snapshot, process_incoming, analyze_positions,
     load_trades_history,
-    load_cash_summary_total_sgd,
-    load_realized_pnl_summary_sgd,
+    load_cash_summary_total,
+    load_realized_pnl_summary,
+    detect_coverage_gaps,
+    get_coverage_summary,
+    OPTION_COLORS
 )
 
 # ============================================================
@@ -45,20 +45,20 @@ def _get_trades_mtime():
 
 
 @st.cache_data(ttl=300)
-def tiger_cached_load_latest_snapshot(mtime):
+def moomoo_cached_load_latest_snapshot(mtime):
     return load_latest_snapshot()
 
 @st.cache_data(ttl=300)
-def tiger_cached_load_trades_history(mtime):
+def moomoo_cached_load_trades_history(mtime):
     return load_trades_history()
 
 @st.cache_data(ttl=300)
-def tiger_cached_load_cash_summary_total_sgd(mtime):
-    return load_cash_summary_total_sgd()
+def moomoo_cached_load_cash_summary_total(mtime):
+    return load_cash_summary_total()
 
 @st.cache_data(ttl=300)
-def tiger_cached_load_realized_pnl_summary_sgd(mtime):
-    return load_realized_pnl_summary_sgd()
+def moomoo_cached_load_realized_pnl_summary(mtime):
+    return load_realized_pnl_summary()
 
 # ============================================================
 # LOAD DATA
@@ -68,48 +68,35 @@ trades_mtime = _get_trades_mtime()
 
 df_positions = None
 total_nav = 0
-cash = 0
+cash_sgd = 0
 real_pnl = 0
 total_deposit = 0
-usd_to_sgd_current = 1.34
 
-loaded = tiger_cached_load_latest_snapshot(history_mtime)
-
+loaded = moomoo_cached_load_latest_snapshot(history_mtime)
 
 if loaded is not None:
     df_positions = loaded["df_positions"]
-    usd_to_sgd_current = loaded.get("usd_to_sgd", 1.34)
+    total_nav = loaded["nav"]
+    cash_sgd = loaded["cash"]
+    real_pnl = loaded["pnl"]
+    total_deposit = loaded["deposit"]
 
-    # History 现在已经是 SGD
-    total_nav = float(loaded["nav"])
-    cash = float(loaded["cash"])
-    real_pnl = float(loaded["pnl"])
-    total_deposit = float(loaded["deposit"])
-
-# Realized P&L SGD
-realized_summary_sgd = tiger_cached_load_realized_pnl_summary_sgd(trades_mtime)
-realized_profit = realized_summary_sgd["realized_profit"]
-realized_loss = realized_summary_sgd["realized_loss"]
-
-# Dividends / Deposits SGD
-cash_summary_sgd = tiger_cached_load_cash_summary_total_sgd(history_mtime)
+# ============================================================
+# REALIZED PROFIT / LOSS (SGD)
+# ============================================================
+realized_summary = moomoo_cached_load_realized_pnl_summary(trades_mtime)
+realized_profit = realized_summary["realized_profit"]
+realized_loss = realized_summary["realized_loss"]
 
 # ============================================================
 # PAGE TITLE
 # ============================================================
-st.title("🐯 Tiger Portfolio")
-
-st.markdown(
-    f"<div style='color:gray; font-size:13px; margin-top:-10px; margin-bottom:14px;'>"
-    f"当前汇率 USD → SGD: {usd_to_sgd_current:.4f} | SGD 仓位直读，USD 仓位按汇率转换"
-    f"</div>",
-    unsafe_allow_html=True
-)
+st.title("🐮 Moomoo Portfolio")
 
 # ============================================================
 # 📅 Statement Coverage / Gap Detection
 # ============================================================
-coverage_info = detect_coverage_gaps("Tiger")
+coverage_info = detect_coverage_gaps("Moomoo")
 
 if coverage_info["ranges"]:
 
@@ -175,10 +162,11 @@ if coverage_info["ranges"]:
     </div>
     """, unsafe_allow_html=True)
 
+
 # ============================================================
-# Tiger Summary Card
+# Moomoo Summary Card
 # ============================================================
-cash_pct = (cash / total_nav * 100) if total_nav != 0 else 0
+cash_pct = (cash_sgd / total_nav * 100) if total_nav != 0 else 0
 portfolio_return = total_nav - total_deposit
 return_pct = (portfolio_return / total_deposit * 100) if total_deposit != 0 else 0
 return_color = "#66FF99" if portfolio_return >= 0 else "#FF6666"
@@ -202,7 +190,7 @@ SGD ${total_nav:,.2f}
 <div>
 <div style='color:gray; font-size:13px;'>Cash</div>
 <div style='color:white; font-size:24px; font-weight:bold;'>
-SGD ${cash:,.2f}
+SGD ${cash_sgd:,.2f}
 </div>
 </div>
 
@@ -273,7 +261,7 @@ SGD ${realized_loss:,.2f}
 # ============================================================
 # ANALYZE POSITIONS
 # ============================================================
-analysis = analyze_positions(df_positions, total_nav, cash)
+analysis = analyze_positions(df_positions, total_nav, cash_sgd)
 
 index_etf_positions = analysis["index_etf_positions"]
 stock_positions = analysis["stock_positions"]
@@ -284,7 +272,7 @@ fx_ratio = analysis["fx_ratio"]
 # ============================================================
 # 🚨 OPTIONS 到期警报
 # ============================================================
-if df_positions is not None and not df_positions.empty and len(option_positions) > 0:
+if df_positions is not None and len(option_positions) > 0:
 
     expiring_7d = []
     expiring_14d = []
@@ -564,7 +552,7 @@ if df_positions is not None and not df_positions.empty:
         unsafe_allow_html=True
     )
 
-    trades_history = tiger_cached_load_trades_history(trades_mtime)
+    trades_history = moomoo_cached_load_trades_history(trades_mtime)
 
     if not trades_history.empty:
 
@@ -573,21 +561,21 @@ if df_positions is not None and not df_positions.empty:
         with t_col1:
             if "Symbol" in trades_history.columns:
                 symbols = ["All"] + sorted(trades_history["Symbol"].dropna().unique().tolist())
-                sel_symbol = st.selectbox("Symbol", symbols, key="tiger_th_symbol")
+                sel_symbol = st.selectbox("Symbol", symbols, key="moomoo_th_symbol")
             else:
                 sel_symbol = "All"
 
         with t_col2:
             if "AssetClass" in trades_history.columns:
                 classes = ["All"] + sorted(trades_history["AssetClass"].dropna().unique().tolist())
-                sel_class = st.selectbox("Asset Class", classes, key="tiger_th_class")
+                sel_class = st.selectbox("Asset Class", classes, key="moomoo_th_class")
             else:
                 sel_class = "All"
 
         with t_col3:
             if "Buy/Sell" in trades_history.columns:
                 sides = ["All"] + sorted(trades_history["Buy/Sell"].dropna().unique().tolist())
-                sel_side = st.selectbox("Buy/Sell", sides, key="tiger_th_side")
+                sel_side = st.selectbox("Buy/Sell", sides, key="moomoo_th_side")
             else:
                 sel_side = "All"
 
@@ -599,6 +587,7 @@ if df_positions is not None and not df_positions.empty:
             filtered = filtered[filtered["AssetClass"] == sel_class]
         if sel_side != "All":
             filtered = filtered[filtered["Buy/Sell"] == sel_side]
+
 
         # ================================
         # ✅ Editable Trade Journal
@@ -614,28 +603,25 @@ if df_positions is not None and not df_positions.empty:
             cols_3dp=["UsdToSgd"],
         )
 
-        # 确保 journal columns 存在
         for col in ["Strategy", "Notes"]:
             if col not in editable_df.columns:
                 editable_df[col] = ""
 
-        # 避免 None/nan 显示和保存出问题
-        for col in ["Strategy", "Notes"]:
-            editable_df[col] = (
-                editable_df[col]
-                .fillna("")
-                .astype(str)
-                .replace("nan", "")
-                .replace("None", "")
-            )
+                for col in ["Strategy", "Notes"]:
+                    editable_df[col] = (
+                        editable_df[col]
+                        .fillna("")
+                        .astype(str)
+                        .replace("nan", "")
+                        .replace("None", "")
+                    )
 
-        # 只允许编辑 Strategy / Notes
         edited_df = st.data_editor(
             editable_df,
             use_container_width=True,
             hide_index=True,
             disabled=[c for c in editable_df.columns if c not in ["Strategy", "Notes"]],
-            key="tiger_trade_journal_editor"
+            key="moomoo_trade_journal_editor"
         )
 
         # ================================
@@ -648,13 +634,11 @@ if df_positions is not None and not df_positions.empty:
                 if not os.path.exists(TRADES_HISTORY_FILE):
                     st.warning("trades_history.csv not found")
                 else:
-                    # ✅ 关键：读取完整 unified trades_history.csv，不是当前 page 的 filtered dataframe
                     full_df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
 
                     if full_df.empty:
                         st.warning("No trades to save")
                     else:
-                        # 确保 columns 存在
                         for col in ["Strategy", "Notes"]:
                             if col not in full_df.columns:
                                 full_df[col] = ""
@@ -663,7 +647,7 @@ if df_positions is not None and not df_positions.empty:
                             if col not in edited_df.columns:
                                 edited_df[col] = ""
 
-                        # ✅ 必须包含 Platform，避免 Tiger save 误伤 IBKR / Moomoo
+                        # ✅ 必须包含 Platform，避免 Moomoo save 误伤 IBKR/Tiger
                         key_cols = [
                             "Platform",
                             "TradeDate",
@@ -674,7 +658,6 @@ if df_positions is not None and not df_positions.empty:
                             "NetCash",
                         ]
 
-                        # 确保 key columns 存在
                         for col in key_cols:
                             if col not in full_df.columns:
                                 full_df[col] = ""
@@ -695,7 +678,6 @@ if df_positions is not None and not df_positions.empty:
                         full_df["_TradeKey"] = make_key(full_df)
                         edited_df["_TradeKey"] = make_key(edited_df)
 
-                        # 只取 edited rows 的 Strategy / Notes
                         updates = edited_df[["_TradeKey", "Strategy", "Notes"]].copy()
 
                         for col in ["Strategy", "Notes"]:
@@ -712,7 +694,6 @@ if df_positions is not None and not df_positions.empty:
                         strategy_map = updates.set_index("_TradeKey")["Strategy"].to_dict()
                         notes_map = updates.set_index("_TradeKey")["Notes"].to_dict()
 
-                        # ✅ 只更新匹配到的 rows，其他平台/其他交易完全保留
                         full_df["Strategy"] = full_df.apply(
                             lambda r: strategy_map[r["_TradeKey"]]
                             if r["_TradeKey"] in strategy_map
@@ -738,12 +719,10 @@ if df_positions is not None and not df_positions.empty:
             except Exception as e:
                 st.error(f"Save failed: {e}")
 
-
         # ============================================================
         # 📈 Trading Performance（用 RealizedPnLSgd）
         # ============================================================
 
-        # Prefer SGD column
         pnl_col = None
         if "RealizedPnLSgd" in filtered.columns:
             pnl_col = "RealizedPnLSgd"
@@ -874,20 +853,22 @@ if df_positions is not None and not df_positions.empty:
                 st.info("暂无关仓交易记录，所以没有 Win Rate 统计。")
 
     else:
-        st.info("暂无交易记录。上传 Tiger CSV 后会自动累加。")
+        st.info("暂无交易记录。上传 CSV 后会自动累加。")
 
     # ============================================================
-    # 💰 Dividends & Deposits 累计（SGD）
+    # 💰 Dividends & Deposits 累计
     # ============================================================
     st.markdown(
         "<div class='section-title'>💰 Dividends & Deposits</div>",
         unsafe_allow_html=True
     )
 
-    if cash_summary_sgd and (
-        cash_summary_sgd["dividends"] != 0
-        or cash_summary_sgd["withholding_tax"] != 0
-        or cash_summary_sgd["deposits"] != 0
+    cash_summary = moomoo_cached_load_cash_summary_total(history_mtime)
+
+    if cash_summary and (
+        cash_summary["dividends"] != 0
+        or cash_summary["withholding_tax"] != 0
+        or cash_summary["deposits"] != 0
     ):
 
         st.markdown(f"""
@@ -900,28 +881,28 @@ if df_positions is not None and not df_positions.empty:
         <div>
         <div style='color:gray; font-size:13px;'>Total Dividends</div>
         <div style='color:#66FF99; font-size:22px; font-weight:bold;'>
-        SGD ${cash_summary_sgd['dividends']:,.2f}
+        SGD ${cash_summary['dividends']:,.2f}
         </div>
         </div>
 
         <div>
         <div style='color:gray; font-size:13px;'>Withholding Tax</div>
         <div style='color:#FF6666; font-size:22px; font-weight:bold;'>
-        SGD ${cash_summary_sgd['withholding_tax']:,.2f}
+        SGD ${cash_summary['withholding_tax']:,.2f}
         </div>
         </div>
 
         <div>
         <div style='color:gray; font-size:13px;'>Net Dividends</div>
         <div style='color:#66FF99; font-size:22px; font-weight:bold;'>
-        SGD ${cash_summary_sgd['net_dividends']:,.2f}
+        SGD ${cash_summary['net_dividends']:,.2f}
         </div>
         </div>
 
         <div>
         <div style='color:gray; font-size:13px;'>Total Deposits</div>
         <div style='color:white; font-size:22px; font-weight:bold;'>
-        SGD ${cash_summary_sgd['deposits']:,.2f}
+        SGD ${cash_summary['deposits']:,.2f}
         </div>
         </div>
 
@@ -937,4 +918,4 @@ if df_positions is not None and not df_positions.empty:
 # NO DATA
 # ============================================================
 else:
-    st.warning("⚠️ 暂无 Tiger 数据，请先在 Overview 页面上传 Tiger Statement CSV。")
+    st.warning("⚠️ 暂无 Moomoo 数据，请先在 Overview 页面上传 CSV 文件。")

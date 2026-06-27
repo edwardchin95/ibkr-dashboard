@@ -5,7 +5,12 @@ import os
 
 st.set_page_config(page_title="Overview", page_icon="📊", layout="wide")
 
-from app import require_auth, load_css, detect_platform, HISTORY_FILE, format_df
+from app import (
+    require_auth, load_css, detect_platform, HISTORY_FILE, format_df,
+    TARGET_ETF_STOCK_TOTAL, TARGET_SINGLE_STOCK,
+    TARGET_OPTION_TOTAL, TARGET_CASH,
+    OPTION_TARGETS, OPTION_COLORS,
+)
 
 # IBKR
 from ibkr import (
@@ -18,9 +23,6 @@ from ibkr import (
     extract_total_deposit as ibkr_extract_total_deposit,
     save_snapshot_and_history as ibkr_save_snapshot_and_history,
     load_realized_pnl_summary as ibkr_load_realized_pnl_summary,
-    TARGET_ETF_STOCK_TOTAL, TARGET_SINGLE_STOCK,
-    TARGET_OPTION_TOTAL, TARGET_CASH,
-    OPTION_TARGETS, OPTION_COLORS,
 )
 
 # Tiger
@@ -29,6 +31,14 @@ from tiger import (
     process_incoming as tiger_process_incoming,
     save_snapshot_and_history as tiger_save_snapshot_and_history,
     load_realized_pnl_summary_sgd as tiger_load_realized_pnl_summary_sgd,
+)
+
+# Moomoo
+from moomoo import (
+    load_latest_snapshot as moomoo_load_latest_snapshot,
+    process_incoming as moomoo_process_incoming,
+    save_snapshot_and_history as moomoo_save_snapshot_and_history,
+    load_realized_pnl_summary_sgd as moomoo_load_realized_pnl_summary_sgd,
 )
 
 # ============================================================
@@ -42,6 +52,7 @@ load_css()
 # ============================================================
 ibkr_process_incoming()
 tiger_process_incoming()
+moomoo_process_incoming()
 
 # ============================================================
 # SIDEBAR
@@ -57,7 +68,7 @@ uploaded_file = st.sidebar.file_uploader(
 # 🔥 Platform Filter
 platform_filter = st.sidebar.selectbox(
     "🔍 平台筛选",
-    ["All", "IBKR", "Tiger"],
+    ["All", "IBKR", "Tiger", "Moomoo"],
     index=0,
     key="platform_filter"
 )
@@ -68,7 +79,12 @@ target_nav = st.sidebar.number_input(
     step=10000
 )
 
-st.sidebar.info("✅ 自动识别平台\n• IBKR Flex Query CSV\n• Tiger Activity Statement CSV")
+st.sidebar.info(
+    "✅ 自动识别平台\n"
+    "• IBKR Flex Query CSV\n"
+    "• Tiger Activity Statement CSV\n"
+    "• Moomoo Statement CSV"
+)
 
 # ============================================================
 # UPLOAD HANDLER
@@ -103,14 +119,22 @@ if uploaded_file is not None:
         st.sidebar.success("✅ Tiger 数据已更新")
         st.cache_data.clear()
 
+    elif platform == "Moomoo":
+        uploaded_file.seek(0)
+        moomoo_save_snapshot_and_history(uploaded_file)
+
+        st.sidebar.success("✅ Moomoo 数据已更新")
+        st.cache_data.clear()
+
     else:
         st.sidebar.error("❌ 无法识别此文件属于哪个平台")
 
 # ============================================================
-# LOAD BOTH PLATFORMS
+# LOAD ALL PLATFORMS
 # ============================================================
 ibkr_loaded = ibkr_load_latest_snapshot()
 tiger_loaded = tiger_load_latest_snapshot()
+moomoo_loaded = moomoo_load_latest_snapshot()
 
 # IBKR data
 ibkr_nav = ibkr_cash = ibkr_pnl = ibkr_deposit = 0
@@ -138,6 +162,19 @@ if tiger_loaded is not None:
     tiger_pnl = float(tiger_loaded["pnl"])
     tiger_deposit = float(tiger_loaded["deposit"])
 
+# Moomoo data
+moomoo_nav = moomoo_cash_v = moomoo_pnl = moomoo_deposit = 0
+moomoo_positions = pd.DataFrame()
+moomoo_history = pd.DataFrame()
+
+if moomoo_loaded is not None:
+    moomoo_positions = moomoo_loaded["df_positions"]
+    moomoo_history = moomoo_loaded["history_df"]
+    moomoo_nav = float(moomoo_loaded["nav"])
+    moomoo_cash_v = float(moomoo_loaded["cash"])
+    moomoo_pnl = float(moomoo_loaded["pnl"])
+    moomoo_deposit = float(moomoo_loaded["deposit"])
+
 # ============================================================
 # APPLY PLATFORM FILTER
 # ============================================================
@@ -148,6 +185,7 @@ if platform_filter == "IBKR":
     cash_sgd = ibkr_cash
     real_pnl = ibkr_pnl
     total_deposit = ibkr_deposit
+
 elif platform_filter == "Tiger":
     df_positions = tiger_positions
     history_df = tiger_history
@@ -155,25 +193,26 @@ elif platform_filter == "Tiger":
     cash_sgd = tiger_cash_v
     real_pnl = tiger_pnl
     total_deposit = tiger_deposit
+
+elif platform_filter == "Moomoo":
+    df_positions = moomoo_positions
+    history_df = moomoo_history
+    total_nav = moomoo_nav
+    cash_sgd = moomoo_cash_v
+    real_pnl = moomoo_pnl
+    total_deposit = moomoo_deposit
+
 else:  # All
-    if not ibkr_positions.empty or not tiger_positions.empty:
-        df_positions = pd.concat([ibkr_positions, tiger_positions], ignore_index=True)
-    else:
-        df_positions = pd.DataFrame()
+    frames_pos = [d for d in [ibkr_positions, tiger_positions, moomoo_positions] if not d.empty]
+    df_positions = pd.concat(frames_pos, ignore_index=True) if frames_pos else pd.DataFrame()
 
-    if not ibkr_history.empty and not tiger_history.empty:
-        history_df = pd.concat([ibkr_history, tiger_history], ignore_index=True)
-    elif not ibkr_history.empty:
-        history_df = ibkr_history
-    elif not tiger_history.empty:
-        history_df = tiger_history
-    else:
-        history_df = pd.DataFrame()
+    frames_hist = [d for d in [ibkr_history, tiger_history, moomoo_history] if not d.empty]
+    history_df = pd.concat(frames_hist, ignore_index=True) if frames_hist else pd.DataFrame()
 
-    total_nav = ibkr_nav + tiger_nav
-    cash_sgd = ibkr_cash + tiger_cash_v
-    real_pnl = ibkr_pnl + tiger_pnl
-    total_deposit = ibkr_deposit + tiger_deposit
+    total_nav = ibkr_nav + tiger_nav + moomoo_nav
+    cash_sgd = ibkr_cash + tiger_cash_v + moomoo_cash_v
+    real_pnl = ibkr_pnl + tiger_pnl + moomoo_pnl
+    total_deposit = ibkr_deposit + tiger_deposit + moomoo_deposit
 
 # ============================================================
 # PREVIOUS NAV (跟 filter 走)
@@ -182,20 +221,29 @@ previous_nav = total_nav
 nav_change = 0
 nav_pct = 0
 
-if platform_filter == "IBKR" and not ibkr_history.empty and len(ibkr_history) > 1:
-    previous_nav = float(ibkr_history.iloc[-2]["NAV"])
-    nav_change = total_nav - previous_nav
-    nav_pct = (nav_change / previous_nav * 100) if previous_nav != 0 else 0
-elif platform_filter == "Tiger" and not tiger_history.empty and len(tiger_history) > 1:
-    previous_nav = float(tiger_history.iloc[-2]["NAV"])
-    nav_change = total_nav - previous_nav
-    nav_pct = (nav_change / previous_nav * 100) if previous_nav != 0 else 0
-elif platform_filter == "All":
-    prev_ibkr = float(ibkr_history.iloc[-2]["NAV"]) if not ibkr_history.empty and len(ibkr_history) > 1 else ibkr_nav
-    prev_tiger = float(tiger_history.iloc[-2]["NAV"]) if not tiger_history.empty and len(tiger_history) > 1 else tiger_nav
-    previous_nav = prev_ibkr + prev_tiger
-    nav_change = total_nav - previous_nav
-    nav_pct = (nav_change / previous_nav * 100) if previous_nav != 0 else 0
+def _prev_nav(df, current_nav):
+    if not df.empty and len(df) > 1 and "NAV" in df.columns:
+        try:
+            return float(df.iloc[-2]["NAV"])
+        except:
+            return current_nav
+    return current_nav
+
+if platform_filter == "IBKR":
+    previous_nav = _prev_nav(ibkr_history, ibkr_nav)
+elif platform_filter == "Tiger":
+    previous_nav = _prev_nav(tiger_history, tiger_nav)
+elif platform_filter == "Moomoo":
+    previous_nav = _prev_nav(moomoo_history, moomoo_nav)
+else:
+    previous_nav = (
+        _prev_nav(ibkr_history, ibkr_nav)
+        + _prev_nav(tiger_history, tiger_nav)
+        + _prev_nav(moomoo_history, moomoo_nav)
+    )
+
+nav_change = total_nav - previous_nav
+nav_pct = (nav_change / previous_nav * 100) if previous_nav != 0 else 0
 
 # ============================================================
 # PORTFOLIO RETURN
@@ -207,6 +255,7 @@ portfolio_return = total_nav - total_deposit
 # ============================================================
 ibkr_realized = ibkr_load_realized_pnl_summary()
 tiger_realized = tiger_load_realized_pnl_summary_sgd()
+moomoo_realized = moomoo_load_realized_pnl_summary_sgd()
 
 if platform_filter == "IBKR":
     total_realized_profit = ibkr_realized["realized_profit"]
@@ -214,9 +263,20 @@ if platform_filter == "IBKR":
 elif platform_filter == "Tiger":
     total_realized_profit = tiger_realized["realized_profit"]
     total_realized_loss = tiger_realized["realized_loss"]
+elif platform_filter == "Moomoo":
+    total_realized_profit = moomoo_realized["realized_profit"]
+    total_realized_loss = moomoo_realized["realized_loss"]
 else:
-    total_realized_profit = ibkr_realized["realized_profit"] + tiger_realized["realized_profit"]
-    total_realized_loss = ibkr_realized["realized_loss"] + tiger_realized["realized_loss"]
+    total_realized_profit = (
+        ibkr_realized["realized_profit"]
+        + tiger_realized["realized_profit"]
+        + moomoo_realized["realized_profit"]
+    )
+    total_realized_loss = (
+        ibkr_realized["realized_loss"]
+        + tiger_realized["realized_loss"]
+        + moomoo_realized["realized_loss"]
+    )
 
 # ============================================================
 # OVERVIEW CARD
@@ -386,10 +446,14 @@ if platform_filter == "All":
         platform_data.append({"Platform": "IBKR", "NAV": ibkr_nav})
     if tiger_nav > 0:
         platform_data.append({"Platform": "Tiger", "NAV": tiger_nav})
+    if moomoo_nav > 0:
+        platform_data.append({"Platform": "Moomoo", "NAV": moomoo_nav})
 elif platform_filter == "IBKR":
     platform_data = [{"Platform": "IBKR", "NAV": ibkr_nav}] if ibkr_nav > 0 else []
-else:
+elif platform_filter == "Tiger":
     platform_data = [{"Platform": "Tiger", "NAV": tiger_nav}] if tiger_nav > 0 else []
+else:
+    platform_data = [{"Platform": "Moomoo", "NAV": moomoo_nav}] if moomoo_nav > 0 else []
 
 if platform_data:
     platform_df = pd.DataFrame(platform_data)
@@ -927,6 +991,7 @@ if len(option_positions) > 0:
                 """,
                 unsafe_allow_html=True
             )
+
 # ============================================================
 # CASH（全平台现金汇总）
 # ============================================================
@@ -942,10 +1007,14 @@ if platform_filter == "All":
         cash_data.append({"Platform": "IBKR", "Cash": ibkr_cash})
     if tiger_nav > 0:
         cash_data.append({"Platform": "Tiger", "Cash": tiger_cash_v})
+    if moomoo_nav > 0:
+        cash_data.append({"Platform": "Moomoo", "Cash": moomoo_cash_v})
 elif platform_filter == "IBKR":
     cash_data = [{"Platform": "IBKR", "Cash": ibkr_cash}] if ibkr_nav > 0 else []
-else:
+elif platform_filter == "Tiger":
     cash_data = [{"Platform": "Tiger", "Cash": tiger_cash_v}] if tiger_nav > 0 else []
+else:
+    cash_data = [{"Platform": "Moomoo", "Cash": moomoo_cash_v}] if moomoo_nav > 0 else []
 
 total_cash = sum(c["Cash"] for c in cash_data)
 total_cash_pct = (total_cash / total_nav * 100) if total_nav != 0 else 0
@@ -1080,7 +1149,7 @@ st.markdown(
 
 if df_positions is not None and not df_positions.empty:
     positions_display = format_df(
-        df_positions,  # 或 combined_positions，看你 code 用哪个变量名
+        df_positions,
         cols_2dp=["Quantity", "Multiplier", "CostPrice", "ClosePrice",
                 "PositionValue", "PositionValueSgd",
                 "UnrealizedPnL", "UnrealizedPnLSgd"],
@@ -1100,8 +1169,9 @@ st.markdown(
 # 决定要画哪条线
 show_ibkr_line = platform_filter in ("All", "IBKR") and not ibkr_history.empty
 show_tiger_line = platform_filter in ("All", "Tiger") and not tiger_history.empty
+show_moomoo_line = platform_filter in ("All", "Moomoo") and not moomoo_history.empty
 
-if show_ibkr_line or show_tiger_line:
+if show_ibkr_line or show_tiger_line or show_moomoo_line:
 
     fig_history = go.Figure()
 
@@ -1129,11 +1199,25 @@ if show_ibkr_line or show_tiger_line:
             )
         )
 
+    if show_moomoo_line and "Timestamp" in moomoo_history.columns and "NAV" in moomoo_history.columns:
+        fig_history.add_trace(
+            go.Scatter(
+                x=moomoo_history["Timestamp"],
+                y=moomoo_history["NAV"],
+                mode="lines+markers",
+                line=dict(color="#FF6699", width=3),
+                marker=dict(size=8),
+                name="Moomoo"
+            )
+        )
+
     # All 模式下加 Combined 线
-    if platform_filter == "All" and show_ibkr_line and show_tiger_line:
-        # 按 Timestamp 合并求和
+    if platform_filter == "All" and (
+        sum([show_ibkr_line, show_tiger_line, show_moomoo_line]) > 1
+    ):
         try:
-            combined_history_df = pd.concat([ibkr_history, tiger_history], ignore_index=True)
+            frames = [d for d in [ibkr_history, tiger_history, moomoo_history] if not d.empty]
+            combined_history_df = pd.concat(frames, ignore_index=True)
             combined_grouped = combined_history_df.groupby("Timestamp")["NAV"].sum().reset_index()
             combined_grouped = combined_grouped.sort_values("Timestamp")
 

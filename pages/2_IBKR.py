@@ -6,14 +6,17 @@ from datetime import datetime
 
 st.set_page_config(page_title="IBKR", page_icon="🟧", layout="wide")
 
-from app import require_auth, load_css, HISTORY_FILE, format_df
+from app import (
+    require_auth, load_css, HISTORY_FILE, format_df, DATA_DIR,
+    TRADES_HISTORY_FILE, OPTION_COLORS,
+    detect_coverage_gaps,
+)
+
 from ibkr import (
     load_latest_snapshot, process_incoming, analyze_positions,
     load_trades_history,
     load_cash_summary_total,
     load_realized_pnl_summary,
-    TRADES_HISTORY_FILE,
-    OPTION_COLORS
 )
 
 # ============================================================
@@ -42,19 +45,19 @@ def _get_trades_mtime():
 
 
 @st.cache_data(ttl=300)
-def ibkr_ibkr_cached_load_latest_snapshot(mtime):
+def ibkr_cached_load_latest_snapshot(mtime):
     return load_latest_snapshot()
 
 @st.cache_data(ttl=300)
-def ibkr_ibkr_cached_load_trades_history(mtime):
+def ibkr_cached_load_trades_history(mtime):
     return load_trades_history()
 
 @st.cache_data(ttl=300)
-def ibkr_ibkr_cached_load_cash_summary_total(mtime):
+def ibkr_cached_load_cash_summary_total(mtime):
     return load_cash_summary_total()
 
 @st.cache_data(ttl=300)
-def ibkr_ibkr_cached_load_realized_pnl_summary(mtime):
+def ibkr_cached_load_realized_pnl_summary(mtime):
     return load_realized_pnl_summary()
 
 # ============================================================
@@ -69,7 +72,7 @@ cash_sgd = 0
 real_pnl = 0
 total_deposit = 0
 
-loaded = ibkr_ibkr_cached_load_latest_snapshot(history_mtime)
+loaded = ibkr_cached_load_latest_snapshot(history_mtime)
 
 if loaded is not None:
     df_positions = loaded["df_positions"]
@@ -81,7 +84,7 @@ if loaded is not None:
 # ============================================================
 # REALIZED PROFIT / LOSS (SGD)
 # ============================================================
-realized_summary = ibkr_ibkr_cached_load_realized_pnl_summary(trades_mtime)
+realized_summary = ibkr_cached_load_realized_pnl_summary(trades_mtime)
 realized_profit = realized_summary["realized_profit"]
 realized_loss = realized_summary["realized_loss"]
 
@@ -89,6 +92,75 @@ realized_loss = realized_summary["realized_loss"]
 # PAGE TITLE
 # ============================================================
 st.title("🟧 IBKR Portfolio")
+
+# ============================================================
+# 📅 Statement Coverage / Gap Detection
+# ============================================================
+coverage_info = detect_coverage_gaps("IBKR")
+
+if coverage_info["ranges"]:
+
+    n_statements = len(coverage_info["ranges"])
+    covered = coverage_info["covered_days"]
+    total = coverage_info["total_days"]
+    n_gaps = len(coverage_info["gaps"])
+    n_overlaps = len(coverage_info["overlaps"])
+
+    if n_gaps == 0:
+        gap_color = "#66FF99"
+        gap_icon = "✅"
+        gap_msg = "无日期缺口"
+    else:
+        gap_color = "#FFC300"
+        gap_icon = "⚠️"
+        gap_msg = f"{n_gaps} 个缺口"
+
+    gap_rows_html = ""
+    if coverage_info["gaps"]:
+        for gs, ge in coverage_info["gaps"]:
+            gap_rows_html += (
+                f"<div style='color:#FFC300; font-size:13px; padding:4px 0;'>"
+                f"• {gs} → {ge}"
+                f"</div>"
+            )
+
+    st.markdown(f"""
+    <div class='card' style='padding:20px; border-left:4px solid {gap_color}; margin-bottom:16px;'>
+
+    <div style='display:grid;
+                grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));
+                gap:20px;'>
+
+    <div>
+    <div style='color:gray; font-size:13px;'>Statements</div>
+    <div style='color:white; font-size:22px; font-weight:bold;'>{n_statements}</div>
+    </div>
+
+    <div>
+    <div style='color:gray; font-size:13px;'>Coverage</div>
+    <div style='color:white; font-size:22px; font-weight:bold;'>
+    {covered} / {total} 天
+    </div>
+    </div>
+
+    <div>
+    <div style='color:gray; font-size:13px;'>Gaps</div>
+    <div style='color:{gap_color}; font-size:22px; font-weight:bold;'>
+    {gap_icon} {gap_msg}
+    </div>
+    </div>
+
+    <div>
+    <div style='color:gray; font-size:13px;'>Overlaps</div>
+    <div style='color:white; font-size:22px; font-weight:bold;'>{n_overlaps}</div>
+    </div>
+
+    </div>
+
+    {f"<div style='border-top:1px solid #333; padding-top:12px; margin-top:14px;'><div style='color:gray; font-size:12px; margin-bottom:6px;'>⚠️ Missing date ranges:</div>{gap_rows_html}<div style='color:gray; font-size:12px; margin-top:8px;'>👉 建议补一份 statement 覆盖缺口，否则 FIFO 可能不准。</div></div>" if coverage_info["gaps"] else ""}
+
+    </div>
+    """, unsafe_allow_html=True)
 
 # ============================================================
 # IBKR Summary Card
@@ -479,7 +551,7 @@ if df_positions is not None and not df_positions.empty:
         unsafe_allow_html=True
     )
 
-    trades_history = ibkr_ibkr_cached_load_trades_history(trades_mtime)
+    trades_history = ibkr_cached_load_trades_history(trades_mtime)
 
     if not trades_history.empty:
 
@@ -515,14 +587,144 @@ if df_positions is not None and not df_positions.empty:
         if sel_side != "All":
             filtered = filtered[filtered["Buy/Sell"] == sel_side]
 
-        display_df = format_df(
-            filtered,
+
+        # ================================
+        # ✅ Editable Trade Journal
+        # ================================
+
+        editable_df = filtered.copy()
+
+        # ⭐ 显示用：2位小数 / 汇率3位小数
+        editable_df = format_df(
+            editable_df,
             cols_2dp=["Quantity", "TradePrice", "NetCash", "Commission",
                     "RealizedPnL", "RealizedPnLSgd"],
             cols_3dp=["UsdToSgd"],
-            date_cols="TradeDate",
         )
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # 确保 journal columns 存在
+        for col in ["Strategy", "Notes"]:
+            if col not in editable_df.columns:
+                editable_df[col] = ""
+
+        # 避免 None/nan 显示和保存出问题
+        for col in ["Strategy", "Notes"]:
+            editable_df[col] = (
+                editable_df[col]
+                .fillna("")
+                .astype(str)
+                .replace("nan", "")
+                .replace("None", "")
+            )
+
+        # 只允许编辑 Strategy / Notes
+        edited_df = st.data_editor(
+            editable_df,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[c for c in editable_df.columns if c not in ["Strategy", "Notes"]],
+            key="ibkr_trade_journal_editor"
+        )
+
+        # ================================
+        # ✅ Save Button
+        # ================================
+
+        if st.button("💾 Save Trade Journal", use_container_width=True):
+
+            try:
+                if not os.path.exists(TRADES_HISTORY_FILE):
+                    st.warning("trades_history.csv not found")
+                else:
+                    # ✅ 关键：读取完整 unified trades_history.csv，不是当前 page 的 filtered dataframe
+                    full_df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+
+                    if full_df.empty:
+                        st.warning("No trades to save")
+                    else:
+                        # 确保 columns 存在
+                        for col in ["Strategy", "Notes"]:
+                            if col not in full_df.columns:
+                                full_df[col] = ""
+
+                        for col in ["Strategy", "Notes"]:
+                            if col not in edited_df.columns:
+                                edited_df[col] = ""
+
+                        # ✅ 必须包含 Platform，避免 IBKR save 误伤 Tiger / Moomoo
+                        key_cols = [
+                            "Platform",
+                            "TradeDate",
+                            "Symbol",
+                            "Buy/Sell",
+                            "Quantity",
+                            "TradePrice",
+                            "NetCash",
+                        ]
+
+                        # 确保 key columns 存在
+                        for col in key_cols:
+                            if col not in full_df.columns:
+                                full_df[col] = ""
+                            if col not in edited_df.columns:
+                                edited_df[col] = ""
+
+                        def make_key(df):
+                            key = df[key_cols].copy()
+                            for c in key_cols:
+                                key[c] = (
+                                    key[c]
+                                    .fillna("")
+                                    .astype(str)
+                                    .str.strip()
+                                )
+                            return key.agg("|".join, axis=1)
+
+                        full_df["_TradeKey"] = make_key(full_df)
+                        edited_df["_TradeKey"] = make_key(edited_df)
+
+                        # 只取 edited rows 的 Strategy / Notes
+                        updates = edited_df[["_TradeKey", "Strategy", "Notes"]].copy()
+
+                        for col in ["Strategy", "Notes"]:
+                            updates[col] = (
+                                updates[col]
+                                .fillna("")
+                                .astype(str)
+                                .replace("nan", "")
+                                .replace("None", "")
+                            )
+
+                        updates = updates.drop_duplicates(subset=["_TradeKey"], keep="last")
+
+                        strategy_map = updates.set_index("_TradeKey")["Strategy"].to_dict()
+                        notes_map = updates.set_index("_TradeKey")["Notes"].to_dict()
+
+                        # ✅ 只更新匹配到的 rows，其他平台/其他交易完全保留
+                        full_df["Strategy"] = full_df.apply(
+                            lambda r: strategy_map[r["_TradeKey"]]
+                            if r["_TradeKey"] in strategy_map
+                            else r.get("Strategy", ""),
+                            axis=1
+                        )
+
+                        full_df["Notes"] = full_df.apply(
+                            lambda r: notes_map[r["_TradeKey"]]
+                            if r["_TradeKey"] in notes_map
+                            else r.get("Notes", ""),
+                            axis=1
+                        )
+
+                        full_df = full_df.drop(columns=["_TradeKey"], errors="ignore")
+
+                        full_df.to_csv(TRADES_HISTORY_FILE, index=False)
+
+                        st.success("✅ Trade journal saved")
+                        st.cache_data.clear()
+                        st.rerun()
+
+            except Exception as e:
+                st.error(f"Save failed: {e}")
 
         # ============================================================
         # 📈 Trading Performance（用 RealizedPnLSgd）
@@ -671,7 +873,7 @@ if df_positions is not None and not df_positions.empty:
         unsafe_allow_html=True
     )
 
-    cash_summary = ibkr_ibkr_cached_load_cash_summary_total(history_mtime)
+    cash_summary = ibkr_cached_load_cash_summary_total(history_mtime)
 
     if cash_summary and (
         cash_summary["dividends"] != 0
