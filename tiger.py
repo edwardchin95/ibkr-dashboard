@@ -1,6 +1,7 @@
 import pandas as pd
 import io
 import os
+import re
 import csv
 from datetime import datetime
 
@@ -80,6 +81,11 @@ def _to_float(value, default=0):
         return default
 
 
+def _safe_float(value, default=0):
+    """Alias to match other modules."""
+    return _to_float(value, default)
+
+
 def _safe_get(row, idx, default=""):
     if idx is None:
         return default
@@ -140,10 +146,6 @@ def _calc_dte(expiry_str):
 
 
 def _activity_to_buy_sell(activity_type, quantity=None):
-    """
-    Tiger ActivityType + Quantity sign -> BUY/SELL.
-    Quantity sign is most reliable.
-    """
     try:
         q = float(quantity)
         if q > 0:
@@ -243,7 +245,6 @@ def _to_sgd(amount, currency, usd_to_sgd, fx_rates):
         return amount
     if currency == "USD":
         return amount * usd_to_sgd
-    # Other currency: native -> USD base -> SGD
     base = _convert_to_base(amount, currency, fx_rates)
     return base * usd_to_sgd
 
@@ -312,11 +313,6 @@ def extract_nav_cash(file_obj):
 # ============================================================
 
 def extract_nav_cash_sgd(file_obj):
-    """
-    SGD positions: direct from native
-    USD positions: × usd_to_sgd
-    Cash: USD base × usd_to_sgd
-    """
     file_obj.seek(0)
     usd_to_sgd = get_usd_to_sgd_rate(file_obj)
 
@@ -375,10 +371,15 @@ def extract_total_pnl(file_obj):
 
 
 # ============================================================
-# CASH SUMMARY
+# CASH SUMMARY (with withdrawal extraction)
 # ============================================================
 
 def parse_cash_summary(file_obj):
+    """
+    ⭐ Returns dict with deposits (positive) AND withdrawals (negative).
+    Tiger statement uses "Deposits/Withdrawals" as a single category;
+    we split by sign.
+    """
     rows = _read_rows(file_obj)
 
     dividends = 0
@@ -392,6 +393,7 @@ def parse_cash_summary(file_obj):
     trading_activity_fees = 0
     interest = 0
     deposits = 0
+    withdrawals = 0
 
     in_base_summary = False
 
@@ -442,8 +444,11 @@ def parse_cash_summary(file_obj):
         elif item == "Interest":
             interest += amount
         elif item in ["Deposits", "Deposits/Withdrawals", "Deposit", "Withdrawal"]:
+            # ⭐ Split by sign
             if amount > 0:
                 deposits += amount
+            else:
+                withdrawals += amount   # negative
 
     fees = (
         commissions + platform_fees + gst + sec_fees
@@ -460,6 +465,7 @@ def parse_cash_summary(file_obj):
         "gst": gst,
         "interest": interest,
         "deposits": deposits,
+        "withdrawals": withdrawals,
     }
 
 
@@ -575,29 +581,20 @@ def parse_tiger_csv(file_obj, usd_to_sgd=None):
 # ============================================================
 
 def _is_trades_header_row(row):
-    """
-    Tiger has multiple Trades sections, each with its own header.
-    Header row pattern: row[0]=="Trades", row[3]=="" (not DATA/TOTAL),
-    and contains "Activity Type" or "Symbol".
-    """
     if len(row) < 5:
         return False
     if _safe_get(row, 0) != "Trades":
         return False
-    # Header rows have empty asset_type at [1]
     if _safe_get(row, 1) != "":
         return False
-    # Header rows don't have "DATA" or "TOTAL" at [3]
     if _safe_get(row, 3) in ("DATA", "TOTAL"):
         return False
-    # Must contain key column names
     has_activity = "Activity Type" in row
     has_symbol = any(s in row for s in ["Symbol", "Symbol(Base.Quote)"])
     return has_activity and has_symbol
 
 
 def _build_idx_map(header):
-    """Build column index map from a header row."""
     def find(name):
         try:
             return header.index(name)
@@ -623,19 +620,6 @@ def _build_idx_map(header):
 
 
 def parse_trades(file_obj, usd_to_sgd=None):
-    """
-    Parse Tiger trades from multiple section headers.
-
-    Tiger statement has 3 types of Trades sections:
-      1. Stock section (with "Accrued Interest in Trade" → 48 cols)
-      2. Option section (no "Accrued Interest" → 47 cols)
-      3. Forex section (USD.SGD换汇 → completely different 13 cols)
-
-    Each section has its own header row. We must track the current
-    section and use its own header to find column indices.
-
-    ⭐ Forex section is SKIPPED entirely (not real trades).
-    """
     rows = _read_rows(file_obj)
     fx_rates = extract_fx_rates(file_obj)
 
@@ -647,48 +631,38 @@ def parse_trades(file_obj, usd_to_sgd=None):
 
     current_header = None
     current_idx = None
-    current_section_type = None  # "Stock" / "Option" / "Forex" / None
+    current_section_type = None
 
     for row in rows:
-        # ===== 1. Detect new Trades header row =====
         if _is_trades_header_row(row):
             current_header = row
             current_idx = _build_idx_map(row)
-            # Detect section type by header columns
             if "Symbol(Base.Quote)" in row:
                 current_section_type = "Forex"
             else:
-                # Stock or Option — actual type depends on data rows
                 current_section_type = "StockOrOption"
             continue
 
-        # ===== 2. Skip non-Trades rows =====
         if _safe_get(row, 0) != "Trades":
             continue
 
-        # ===== 3. Need a current header =====
         if current_idx is None:
             continue
 
-        # ===== 4. Get asset_type and row_type =====
         asset_type = _safe_get(row, 1)
         row_type = _safe_get(row, 3)
 
         if row_type != "DATA":
             continue
 
-        # ===== 5. Skip Forex (换汇 not a real trade) =====
         if asset_type == "Forex":
             continue
 
-        # Only process Stock / Option
         if asset_type not in ("Stock", "Option"):
             continue
 
-        # ===== 6. Extract Symbol/Description =====
         description = _safe_get(row, current_idx.get("Symbol"))
         if description == "":
-            # Tiger has duplicate rows where the second is blank — skip
             continue
 
         asset_class = "OPT" if asset_type == "Option" else "STK"
@@ -699,7 +673,6 @@ def parse_trades(file_obj, usd_to_sgd=None):
         else:
             symbol = _parse_stock_symbol(description)
 
-        # ===== 7. Extract numeric / text fields =====
         activity_type = _safe_get(row, current_idx.get("Activity Type"))
         qty_raw = _safe_get(row, current_idx.get("Quantity"))
         buy_sell = _activity_to_buy_sell(activity_type, quantity=qty_raw)
@@ -891,6 +864,53 @@ def load_trades_history():
 
 
 # ============================================================
+# ⭐ CUMULATIVE RECOMPUTE (cumsum-based, avoid re-upload bug)
+# ============================================================
+
+def _recompute_cumulative(history_df, platform):
+    """Recompute Total* fields from cumsum of Period* values (chronological)."""
+    if history_df is None or history_df.empty:
+        return history_df
+    if "Platform" not in history_df.columns:
+        return history_df
+
+    df = history_df.copy()
+
+    mask = df["Platform"].astype(str) == platform
+    if not mask.any():
+        return df
+
+    sub = df[mask].copy()
+
+    def _extract_end_date(snap):
+        s = str(snap)
+        m = re.search(r"\(\d{8}-(\d{8})\)", s)
+        if m:
+            return m.group(1)
+        return "00000000"
+
+    sub["_sort_key"] = sub["SnapshotFile"].apply(_extract_end_date)
+    sub = sub.sort_values("_sort_key")
+
+    for total_col, period_col in [
+        ("TotalDeposit", "PeriodDeposit"),
+        ("TotalWithdrawal", "PeriodWithdrawal"),
+        ("TotalOther", "PeriodOther"),
+    ]:
+        if period_col in sub.columns:
+            period_vals = pd.to_numeric(sub[period_col], errors="coerce").fillna(0)
+            sub[total_col] = period_vals.cumsum()
+
+    sub = sub.drop(columns=["_sort_key"], errors="ignore")
+
+    for col in ["TotalDeposit", "TotalWithdrawal", "TotalOther"]:
+        if col in sub.columns:
+            df.loc[sub.index, col] = sub[col]
+
+    return df
+
+
+# ============================================================
 # SAVE SNAPSHOT + HISTORY
 # ============================================================
 
@@ -930,8 +950,13 @@ def save_snapshot_and_history(uploaded_file, *_args):
 
     uploaded_file.seek(0)
     cash_summary = parse_cash_summary(uploaded_file)
+
+    # ⭐ Extract deposit + withdrawal (already in base USD, convert to SGD)
     deposit_usd = cash_summary.get("deposits", 0)
+    withdrawal_usd = cash_summary.get("withdrawals", 0)
     deposit_sgd = deposit_usd * usd_to_sgd
+    withdrawal_sgd = withdrawal_usd * usd_to_sgd
+    period_other = 0  # Tiger doesn't have an "other" category
 
     snapshot_path = os.path.join(TIGER_SNAPSHOT_DIR, snapshot_filename)
     with open(snapshot_path, "wb") as f:
@@ -945,22 +970,12 @@ def save_snapshot_and_history(uploaded_file, *_args):
     else:
         history_df = pd.DataFrame()
 
-    previous_total_deposit = 0
-    if not history_df.empty:
-        if "Platform" in history_df.columns:
-            tiger_only = history_df[history_df["Platform"] == "Tiger"]
-        else:
-            tiger_only = pd.DataFrame()
-        if len(tiger_only) > 0 and "TotalDeposit" in tiger_only.columns:
-            previous_total_deposit = tiger_only.iloc[-1]["TotalDeposit"]
-
-    cumulative_deposit = previous_total_deposit + deposit_sgd
-
     dividends_usd = cash_summary.get("dividends", 0)
     withholding_tax_usd = cash_summary.get("withholding_tax", 0)
     fees_usd = cash_summary.get("fees", 0)
     net_dividends_usd = cash_summary.get("net_dividends", dividends_usd + withholding_tax_usd)
 
+    # ⭐ Add new row with Period* values; Total* recomputed via cumsum
     new_row = pd.DataFrame([{
         "Platform": "Tiger",
         "Timestamp": timestamp,
@@ -968,8 +983,12 @@ def save_snapshot_and_history(uploaded_file, *_args):
         "NAV": nav_sgd,
         "Cash": cash_sgd,
         "PnL": pnl_sgd,
-        "TotalDeposit": cumulative_deposit,
+        "TotalDeposit": 0,
         "PeriodDeposit": deposit_sgd,
+        "TotalWithdrawal": 0,
+        "PeriodWithdrawal": withdrawal_sgd,
+        "TotalOther": 0,
+        "PeriodOther": period_other,
         "Dividends": dividends_usd * usd_to_sgd,
         "WithholdingTax": withholding_tax_usd * usd_to_sgd,
         "NetDividends": net_dividends_usd * usd_to_sgd,
@@ -983,6 +1002,9 @@ def save_snapshot_and_history(uploaded_file, *_args):
         history_df = history_df.drop_duplicates(
             subset=["Platform", "SnapshotFile"], keep="last"
         )
+
+    # ⭐ Recompute Total* from cumsum
+    history_df = _recompute_cumulative(history_df, "Tiger")
 
     history_df.to_csv(HISTORY_FILE, index=False)
 
@@ -1049,7 +1071,9 @@ def load_latest_snapshot():
         "stock_nav": nav_data["stock_nav_sgd"],
         "option_nav": nav_data["option_nav_sgd"],
         "pnl": latest["PnL"],
-        "deposit": latest["TotalDeposit"],
+        "deposit": _safe_float(latest.get("TotalDeposit", 0), 0),
+        "withdrawal": _safe_float(latest.get("TotalWithdrawal", 0), 0),
+        "other": _safe_float(latest.get("TotalOther", 0), 0),
         "usd_to_sgd": usd_to_sgd,
         "platform": "Tiger",
     }
@@ -1106,8 +1130,12 @@ def process_incoming():
 
             fake_upload.seek(0)
             cash_summary = parse_cash_summary(fake_upload)
+
             deposit_usd = cash_summary.get("deposits", 0)
+            withdrawal_usd = cash_summary.get("withdrawals", 0)
             deposit_sgd = deposit_usd * usd_to_sgd
+            withdrawal_sgd = withdrawal_usd * usd_to_sgd
+            period_other = 0
 
             fake_upload.seek(0)
             save_trades_history(fake_upload, usd_to_sgd=usd_to_sgd)
@@ -1130,15 +1158,6 @@ def process_incoming():
             new_name = f
             timestamp = f.replace("tiger_", "").replace(".csv", "")
 
-        previous_deposit = 0
-        if not history_df.empty:
-            if "Platform" in history_df.columns:
-                tiger_only = history_df[history_df["Platform"] == "Tiger"]
-            else:
-                tiger_only = pd.DataFrame()
-            if len(tiger_only) > 0 and "TotalDeposit" in tiger_only.columns:
-                previous_deposit = tiger_only.iloc[-1]["TotalDeposit"]
-
         new_row = pd.DataFrame([{
             "Platform": "Tiger",
             "Timestamp": timestamp,
@@ -1146,8 +1165,12 @@ def process_incoming():
             "NAV": nav_sgd,
             "Cash": cash_sgd,
             "PnL": pnl_sgd,
-            "TotalDeposit": previous_deposit + deposit_sgd,
+            "TotalDeposit": 0,
             "PeriodDeposit": deposit_sgd,
+            "TotalWithdrawal": 0,
+            "PeriodWithdrawal": withdrawal_sgd,
+            "TotalOther": 0,
+            "PeriodOther": period_other,
             "Dividends": dividends_usd * usd_to_sgd,
             "WithholdingTax": withholding_tax_usd * usd_to_sgd,
             "NetDividends": net_dividends_usd * usd_to_sgd,
@@ -1164,6 +1187,9 @@ def process_incoming():
         history_df = history_df.drop_duplicates(
             subset=["Platform", "SnapshotFile"], keep="last"
         )
+
+    # ⭐ Recompute Total* from cumsum
+    history_df = _recompute_cumulative(history_df, "Tiger")
 
     history_df.to_csv(HISTORY_FILE, index=False)
 
@@ -1301,32 +1327,37 @@ def load_cash_summary_total():
 
 
 def load_cash_summary_total_sgd():
+    default = {
+        "dividends": 0, "withholding_tax": 0, "net_dividends": 0,
+        "fees": 0, "deposits": 0, "withdrawals": 0, "other": 0,
+    }
+
     if not os.path.exists(HISTORY_FILE):
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
     try:
         df = pd.read_csv(HISTORY_FILE)
     except:
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
     if df.empty:
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
     if "Platform" in df.columns:
         df = df[df["Platform"] == "Tiger"]
 
     if df.empty:
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
-    for col in ["Dividends", "WithholdingTax", "NetDividends", "Fees", "PeriodDeposit"]:
+    for col in ["Dividends", "WithholdingTax", "NetDividends", "Fees",
+                "PeriodDeposit", "PeriodWithdrawal", "PeriodOther"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    total_deposit = 0
-    if "TotalDeposit" in df.columns:
-        td = pd.to_numeric(df["TotalDeposit"], errors="coerce").fillna(0)
-        if len(td) > 0:
-            total_deposit = float(td.iloc[-1])
+    # Sum Period* (robust to re-uploads)
+    total_deposit = float(df["PeriodDeposit"].sum()) if "PeriodDeposit" in df.columns else 0
+    total_withdrawal = float(df["PeriodWithdrawal"].sum()) if "PeriodWithdrawal" in df.columns else 0
+    total_other = float(df["PeriodOther"].sum()) if "PeriodOther" in df.columns else 0
 
     return {
         "dividends": float(df["Dividends"].sum()) if "Dividends" in df.columns else 0,
@@ -1334,6 +1365,8 @@ def load_cash_summary_total_sgd():
         "net_dividends": float(df["NetDividends"].sum()) if "NetDividends" in df.columns else 0,
         "fees": float(df["Fees"].sum()) if "Fees" in df.columns else 0,
         "deposits": total_deposit,
+        "withdrawals": total_withdrawal,
+        "other": total_other,
     }
 
 

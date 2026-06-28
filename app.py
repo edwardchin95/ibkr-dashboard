@@ -79,10 +79,15 @@ UNIFIED_TRADES_COLS = [
 
 JOURNAL_COLS = ["Strategy", "Notes"]
 
+# ⭐ Withdrawals stored as NEGATIVE (e.g. -500). Net Capital = Deposits + Withdrawals.
+# ⭐ Other = misc cashflow not categorized as Deposit/Withdrawal/Dividend/Tax/Fee
+#    (e.g. Moomoo's Stock Yield Income, MM Fund movements, currency exchange)
 UNIFIED_HISTORY_COLS = [
     "Platform", "Timestamp", "SnapshotFile",
     "NAV", "Cash", "PnL",
     "TotalDeposit", "PeriodDeposit",
+    "TotalWithdrawal", "PeriodWithdrawal",
+    "TotalOther", "PeriodOther",
     "Dividends", "WithholdingTax", "NetDividends", "Fees",
     "UsdToSgd",
 ]
@@ -99,7 +104,6 @@ def check_password():
     if st.session_state["authenticated"]:
         return True
 
-    # 全屏覆盖样式
     st.markdown("""
     <style>
     [data-testid="stSidebar"] { display: none; }
@@ -124,6 +128,7 @@ def check_password():
             st.error("密码错误")
             st.stop()
 
+
 def require_auth():
     """子页面调用 — 未登录时显示密码框（不再要求跳 app 页）"""
     if "authenticated" not in st.session_state:
@@ -132,7 +137,6 @@ def require_auth():
     if st.session_state["authenticated"]:
         return True
 
-    # 未登录 → 显示全屏密码框
     st.markdown("""
     <style>
     [data-testid="stSidebar"] { display: none; }
@@ -156,6 +160,7 @@ def require_auth():
         else:
             st.error("密码错误")
             st.stop()
+
 
 # ============================================================
 # CSS
@@ -281,6 +286,8 @@ def load_css():
     }
 
     </style>""", unsafe_allow_html=True)
+
+
 # ============================================================
 # Helper: 格式化 dataframe 显示
 # ============================================================
@@ -288,7 +295,7 @@ def format_df(df, cols_2dp=None, cols_3dp=None, date_cols=None):
     """
     Format dataframe for display.
     - cols_2dp: round to 2 decimals
-    - cols_3dp: round to 3 decimals  
+    - cols_3dp: round to 3 decimals
     - date_cols: normalize date columns (handles YYYYMMDD and "2026-05-26 09:31:33,")
     """
     out = df.copy()
@@ -318,6 +325,8 @@ def format_df(df, cols_2dp=None, cols_3dp=None, date_cols=None):
                 out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
 
     return out
+
+
 # ============================================================
 # Detect Platform
 # ============================================================
@@ -334,14 +343,11 @@ def detect_platform(file_bytes):
         return "Moomoo"
 
     # ---- Tiger 检测 ----
-    # Tiger Activity Statement 特征：包含 "Tiger Brokers" 或 "Activity Statement"
-    # + Account Overview + Holdings 两个 section
     if b"Tiger Brokers" in file_bytes or b"Activity Statement" in file_bytes:
         if b"Account Overview" in file_bytes and b"Holdings" in file_bytes:
             return "Tiger"
 
     # ---- IBKR 检测 ----
-    # IBKR Flex Query 特征：有 AssetClass 列名 或 ClientAccountID
     if b'"AssetClass"' in file_bytes or b"ClientAccountID" in file_bytes:
         return "IBKR"
 

@@ -1,7 +1,8 @@
 import pandas as pd
 import io
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 
 from app import (
     SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR,
@@ -175,10 +176,14 @@ def extract_total_pnl(file_obj):
 
 
 # ============================================================
-# EXTRACT TOTAL DEPOSIT
+# EXTRACT TOTAL DEPOSIT / WITHDRAWAL
 # ============================================================
 
-def extract_total_deposit(file_obj):
+def extract_deposits_and_withdrawals(file_obj):
+    """
+    ⭐ Returns (total_deposit, total_withdrawal).
+    Withdrawals are returned as NEGATIVE values.
+    """
     content = file_obj.getvalue().decode("utf-8")
     lines = content.splitlines()
 
@@ -195,7 +200,7 @@ def extract_total_deposit(file_obj):
             rows.append(line)
 
     if len(rows) == 0:
-        return 0
+        return 0, 0
 
     csv_text = "\n".join(rows)
     columns = ["Currency", "AssetClass", "DateTime", "Amount", "Type", "Description"]
@@ -203,14 +208,22 @@ def extract_total_deposit(file_obj):
     try:
         df = pd.read_csv(io.StringIO(csv_text), names=columns)
     except:
-        return 0
+        return 0, 0
 
     deposit_df = df[df["Type"] == "Deposits/Withdrawals"]
     if len(deposit_df) == 0:
-        return 0
+        return 0, 0
 
     total_deposit = deposit_df[deposit_df["Amount"] > 0]["Amount"].sum()
-    return float(total_deposit)
+    total_withdrawal = deposit_df[deposit_df["Amount"] < 0]["Amount"].sum()
+
+    return float(total_deposit), float(total_withdrawal)
+
+
+def extract_total_deposit(file_obj):
+    """Kept for backwards compatibility — only positive deposits."""
+    deposit, _ = extract_deposits_and_withdrawals(file_obj)
+    return deposit
 
 
 # ============================================================
@@ -379,10 +392,64 @@ def parse_ibkr_csv(file_obj):
 
 
 # ============================================================
+# ⭐ CUMULATIVE RECOMPUTE (cumsum-based, avoid re-upload bug)
+# ============================================================
+
+def _recompute_cumulative(history_df, platform):
+    """
+    Recompute Total* fields from cumsum of Period* values (chronological order).
+    Robust to re-uploads.
+    """
+    if history_df is None or history_df.empty:
+        return history_df
+    if "Platform" not in history_df.columns:
+        return history_df
+
+    df = history_df.copy()
+
+    mask = df["Platform"].astype(str) == platform
+    if not mask.any():
+        return df
+
+    sub = df[mask].copy()
+
+    def _extract_end_date(snap):
+        s = str(snap)
+        m = re.search(r"\(\d{8}-(\d{8})\)", s)
+        if m:
+            return m.group(1)
+        return "00000000"
+
+    sub["_sort_key"] = sub["SnapshotFile"].apply(_extract_end_date)
+    sub = sub.sort_values("_sort_key")
+
+    for total_col, period_col in [
+        ("TotalDeposit", "PeriodDeposit"),
+        ("TotalWithdrawal", "PeriodWithdrawal"),
+        ("TotalOther", "PeriodOther"),
+    ]:
+        if period_col in sub.columns:
+            period_vals = pd.to_numeric(sub[period_col], errors="coerce").fillna(0)
+            sub[total_col] = period_vals.cumsum()
+
+    sub = sub.drop(columns=["_sort_key"], errors="ignore")
+
+    for col in ["TotalDeposit", "TotalWithdrawal", "TotalOther"]:
+        if col in sub.columns:
+            df.loc[sub.index, col] = sub[col]
+
+    return df
+
+
+# ============================================================
 # SAVE SNAPSHOT + HISTORY
 # ============================================================
 
 def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
+    """
+    Note: 'deposit' arg is kept for backwards compatibility with Overview page.
+    We re-compute deposit/withdrawal from the file ourselves.
+    """
     upload_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     original_name = uploaded_file.name
@@ -412,13 +479,16 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
     with open(snapshot_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    # Cash summary (already SGD in IBKR)
+    # ⭐ Re-extract deposit + withdrawal ourselves
     uploaded_file.seek(0)
+    period_deposit, period_withdrawal = extract_deposits_and_withdrawals(uploaded_file)
+    uploaded_file.seek(0)
+
+    # Cash summary (already SGD in IBKR)
     cash_summary = parse_cash_summary(uploaded_file)
     uploaded_file.seek(0)
 
     # fx_ratio
-    uploaded_file.seek(0)
     fx_ratio = _compute_fx_ratio(uploaded_file)
     uploaded_file.seek(0)
 
@@ -426,6 +496,9 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
     withholding_tax = cash_summary.get("withholding_tax", 0)
     fees = cash_summary.get("fees", 0)
     net_dividends = dividends + withholding_tax
+
+    # IBKR has no "other" cashflow category
+    period_other = 0
 
     # Load existing history
     if os.path.exists(HISTORY_FILE):
@@ -436,18 +509,7 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
     else:
         history_df = pd.DataFrame()
 
-    # Filter only IBKR rows for cumulative deposit
-    previous_total_deposit = 0
-    if not history_df.empty:
-        if "Platform" in history_df.columns:
-            ibkr_only = history_df[history_df["Platform"] == "IBKR"]
-        else:
-            ibkr_only = history_df
-        if len(ibkr_only) > 0 and "TotalDeposit" in ibkr_only.columns:
-            previous_total_deposit = ibkr_only.iloc[-1]["TotalDeposit"]
-
-    cumulative_deposit = previous_total_deposit + deposit
-
+    # ⭐ Add new row with Period* values; Total* recomputed via cumsum
     new_row = pd.DataFrame([{
         "Platform": "IBKR",
         "Timestamp": timestamp,
@@ -455,8 +517,12 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
         "NAV": nav,
         "Cash": cash,
         "PnL": pnl,
-        "TotalDeposit": cumulative_deposit,
-        "PeriodDeposit": deposit,
+        "TotalDeposit": 0,
+        "PeriodDeposit": period_deposit,
+        "TotalWithdrawal": 0,
+        "PeriodWithdrawal": period_withdrawal,
+        "TotalOther": 0,
+        "PeriodOther": period_other,
         "Dividends": dividends,
         "WithholdingTax": withholding_tax,
         "NetDividends": net_dividends,
@@ -470,6 +536,9 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
         history_df = history_df.drop_duplicates(
             subset=["Platform", "SnapshotFile"], keep="last"
         )
+
+    # ⭐ Recompute Total* from cumsum
+    history_df = _recompute_cumulative(history_df, "IBKR")
 
     history_df.to_csv(HISTORY_FILE, index=False)
 
@@ -534,7 +603,9 @@ def load_latest_snapshot():
         "stock_nav_sgd": stock_nav_snap,
         "option_nav_sgd": option_nav_snap,
         "pnl": latest["PnL"],
-        "deposit": latest["TotalDeposit"],
+        "deposit": _safe_float(latest.get("TotalDeposit", 0), 0),
+        "withdrawal": _safe_float(latest.get("TotalWithdrawal", 0), 0),
+        "other": _safe_float(latest.get("TotalOther", 0), 0),
         "platform": "IBKR",
     }
 
@@ -583,8 +654,9 @@ def process_incoming():
             fake_upload.seek(0)
             pnl = extract_total_pnl(fake_upload)
 
+            # ⭐ Extract deposit + withdrawal together
             fake_upload.seek(0)
-            deposit = extract_total_deposit(fake_upload)
+            period_deposit, period_withdrawal = extract_deposits_and_withdrawals(fake_upload)
 
             fake_upload.seek(0)
             cash_summary = parse_cash_summary(fake_upload)
@@ -599,6 +671,7 @@ def process_incoming():
         withholding_tax = cash_summary.get("withholding_tax", 0)
         fees = cash_summary.get("fees", 0)
         net_dividends = dividends + withholding_tax
+        period_other = 0  # IBKR doesn't have an "other" category
 
         # === 新命名 + 真实日期 timestamp ===
         def _ymd(d):
@@ -609,7 +682,6 @@ def process_incoming():
 
         if fd and ld:
             new_name = f"ibkr_statement({fd}-{ld}).csv"
-            # 把 YYYYMMDD 转成 YYYY-MM-DD
             if len(ld) == 8 and ld.isdigit():
                 timestamp = f"{ld[:4]}-{ld[4:6]}-{ld[6:8]}"
             else:
@@ -618,15 +690,6 @@ def process_incoming():
             new_name = f
             timestamp = f.replace("ibkr_flex_", "").replace(".csv", "")
 
-        previous_deposit = 0
-        if not history_df.empty:
-            if "Platform" in history_df.columns:
-                ibkr_only = history_df[history_df["Platform"] == "IBKR"]
-            else:
-                ibkr_only = history_df
-            if len(ibkr_only) > 0 and "TotalDeposit" in ibkr_only.columns:
-                previous_deposit = ibkr_only.iloc[-1]["TotalDeposit"]
-
         new_row = pd.DataFrame([{
             "Platform": "IBKR",
             "Timestamp": timestamp,
@@ -634,8 +697,12 @@ def process_incoming():
             "NAV": nav,
             "Cash": cash,
             "PnL": pnl,
-            "TotalDeposit": previous_deposit + deposit,
-            "PeriodDeposit": deposit,
+            "TotalDeposit": 0,
+            "PeriodDeposit": period_deposit,
+            "TotalWithdrawal": 0,
+            "PeriodWithdrawal": period_withdrawal,
+            "TotalOther": 0,
+            "PeriodOther": period_other,
             "Dividends": dividends,
             "WithholdingTax": withholding_tax,
             "NetDividends": net_dividends,
@@ -652,6 +719,9 @@ def process_incoming():
         history_df = history_df.drop_duplicates(
             subset=["Platform", "SnapshotFile"], keep="last"
         )
+
+    # ⭐ Recompute Total* from cumsum
+    history_df = _recompute_cumulative(history_df, "IBKR")
 
     history_df.to_csv(HISTORY_FILE, index=False)
 
@@ -1024,6 +1094,9 @@ def load_trades_history():
 # ============================================================
 
 def parse_cash_summary(file_obj):
+    """
+    ⭐ Returns dict with deposits (positive) AND withdrawals (negative).
+    """
     content = file_obj.getvalue().decode("utf-8")
     lines = content.splitlines()
 
@@ -1039,8 +1112,13 @@ def parse_cash_summary(file_obj):
         if cash_section:
             rows.append(line)
 
+    default = {
+        "dividends": 0, "withholding_tax": 0,
+        "fees": 0, "deposits": 0, "withdrawals": 0,
+    }
+
     if len(rows) == 0:
-        return {"dividends": 0, "withholding_tax": 0, "fees": 0, "deposits": 0}
+        return default
 
     csv_text = "\n".join(rows)
     columns = ["Currency", "AssetClass", "DateTime", "Amount", "Type", "Description"]
@@ -1048,12 +1126,13 @@ def parse_cash_summary(file_obj):
     try:
         df = pd.read_csv(io.StringIO(csv_text), names=columns)
     except:
-        return {"dividends": 0, "withholding_tax": 0, "fees": 0, "deposits": 0}
+        return default
 
     dividends = 0
     withholding_tax = 0
     fees = 0
     deposits = 0
+    withdrawals = 0
 
     for _, row in df.iterrows():
         try:
@@ -1074,6 +1153,8 @@ def parse_cash_summary(file_obj):
         elif type_str == "Deposits/Withdrawals":
             if amount > 0:
                 deposits += amount
+            else:
+                withdrawals += amount   # ⭐ negative
         elif type_str == "Other Fees" or "Fee" in desc:
             fees += amount
 
@@ -1082,6 +1163,7 @@ def parse_cash_summary(file_obj):
         "withholding_tax": withholding_tax,
         "fees": fees,
         "deposits": deposits,
+        "withdrawals": withdrawals,
     }
 
 
@@ -1090,32 +1172,37 @@ def parse_cash_summary(file_obj):
 # ============================================================
 
 def load_cash_summary_total():
+    default = {
+        "dividends": 0, "withholding_tax": 0, "net_dividends": 0,
+        "fees": 0, "deposits": 0, "withdrawals": 0, "other": 0,
+    }
+
     if not os.path.exists(HISTORY_FILE):
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
     try:
         df = pd.read_csv(HISTORY_FILE)
     except:
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
     if df.empty:
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
     if "Platform" in df.columns:
         df = df[df["Platform"] == "IBKR"]
 
     if df.empty:
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
-    for col in ["Dividends", "WithholdingTax", "NetDividends", "Fees", "PeriodDeposit"]:
+    for col in ["Dividends", "WithholdingTax", "NetDividends", "Fees",
+                "PeriodDeposit", "PeriodWithdrawal", "PeriodOther"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    total_deposit = 0
-    if "TotalDeposit" in df.columns:
-        td = pd.to_numeric(df["TotalDeposit"], errors="coerce").fillna(0)
-        if len(td) > 0:
-            total_deposit = float(td.iloc[-1])
+    # Sum Period* (robust to re-uploads)
+    total_deposit = float(df["PeriodDeposit"].sum()) if "PeriodDeposit" in df.columns else 0
+    total_withdrawal = float(df["PeriodWithdrawal"].sum()) if "PeriodWithdrawal" in df.columns else 0
+    total_other = float(df["PeriodOther"].sum()) if "PeriodOther" in df.columns else 0
 
     return {
         "dividends": float(df["Dividends"].sum()) if "Dividends" in df.columns else 0,
@@ -1123,6 +1210,8 @@ def load_cash_summary_total():
         "net_dividends": float(df["NetDividends"].sum()) if "NetDividends" in df.columns else 0,
         "fees": float(df["Fees"].sum()) if "Fees" in df.columns else 0,
         "deposits": total_deposit,
+        "withdrawals": total_withdrawal,
+        "other": total_other,
     }
 
 

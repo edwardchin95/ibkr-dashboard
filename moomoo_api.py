@@ -1,19 +1,20 @@
 """
 Moomoo API → Statement CSV (with simplified GUI)
 - Account Overview / Holdings / Trades
-- Cash Summary (Deposits / Dividends / WithholdingTax / Fees) ⭐ NEW
+- Cash Summary (Deposits / Dividends / WithholdingTax / Fees)
 - Options parsed (underlying/strike/expiry/DTE)
 - Commission via order_fee_query
-- Positions Realized P&L from API (realized_pl)
-- Trades Realized P&L left blank → dashboard FIFO will compute
-- Date range inclusive (00:00:00 → 23:59:59)
-- Filename: moomoo_statement(YYYYMMDD-YYYYMMDD).csv
+- ⭐ Historical FX conversion (frankfurter.app + local cache)
+- Background-threaded export to keep GUI responsive
 """
 
 import os
 import re
 import csv
+import json
 import time
+import threading
+import urllib.request
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, timedelta
@@ -33,8 +34,13 @@ DEFAULT_HKDSGD = 0.17
 
 OPTION_MULTIPLIER = 100
 
-# Rate limit: 10 requests / 30s per acc_id → ~3s per request to be safe
-CASH_FLOW_SLEEP = 3.2
+CASH_FLOW_SLEEP = 3.2  # 10 reqs / 30s rate limit
+
+FX_CACHE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "fx_cache.json"
+)
+_FX_CACHE = None  # Lazy-loaded dict
 
 UNIFIED_POSITIONS_COLS = [
     "Platform", "Symbol", "Description", "AssetClass", "Currency",
@@ -115,17 +121,6 @@ def detect_currency_from_code(code):
     return "USD"
 
 
-def convert_to_sgd(amount, currency, usd_to_sgd, hkd_to_sgd):
-    currency = safe_str(currency).upper()
-    if currency == "SGD":
-        return amount
-    if currency == "USD":
-        return amount * usd_to_sgd
-    if currency == "HKD":
-        return amount * hkd_to_sgd
-    return amount
-
-
 def clean_symbol(code):
     code = safe_str(code)
     if "." in code:
@@ -139,6 +134,184 @@ def call_api(func, **kwargs):
     except TypeError:
         kwargs2 = {k: v for k, v in kwargs.items() if k != "acc_id"}
         return func(**kwargs2)
+
+
+# ============================================================
+# ⭐ HISTORICAL FX (frankfurter.app + cache)
+# ============================================================
+def _load_fx_cache():
+    """Load FX cache from disk."""
+    global _FX_CACHE
+    if _FX_CACHE is not None:
+        return _FX_CACHE
+    try:
+        if os.path.exists(FX_CACHE_FILE):
+            with open(FX_CACHE_FILE, "r", encoding="utf-8") as f:
+                _FX_CACHE = json.load(f)
+        else:
+            _FX_CACHE = {}
+    except Exception:
+        _FX_CACHE = {}
+    return _FX_CACHE
+
+
+def _save_fx_cache():
+    """Save FX cache to disk."""
+    try:
+        with open(FX_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_FX_CACHE, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ Failed to save fx_cache.json: {e}")
+
+
+def _fx_pair_key(from_ccy, to_ccy):
+    return f"{from_ccy.upper()}_{to_ccy.upper()}"
+
+
+def fetch_historical_fx_range(start_date, end_date, from_ccy, to_ccy, log=print):
+    """
+    Pre-fetch all historical FX rates in [start_date, end_date] in ONE API call.
+    Caches results to fx_cache.json.
+
+    Source: https://api.frankfurter.app
+    Free, no API key, daily rates back to 1999.
+    Note: weekends/holidays have no data — we fallback to nearest earlier weekday.
+    """
+    cache = _load_fx_cache()
+    key = _fx_pair_key(from_ccy, to_ccy)
+    if key not in cache:
+        cache[key] = {}
+    pair_cache = cache[key]
+
+    # Check if range is already cached
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+    except Exception as e:
+        log(f"⚠️ Invalid date for FX fetch: {e}")
+        return pair_cache
+
+    # Determine missing weekdays
+    missing_weekdays = []
+    cur = start
+    while cur <= end:
+        # skip weekends (no FX market data)
+        if cur.weekday() < 5:
+            ds = cur.strftime("%Y-%m-%d")
+            if ds not in pair_cache:
+                missing_weekdays.append(ds)
+        cur += timedelta(days=1)
+
+    if not missing_weekdays:
+        log(f"   💾 FX cache hit: {from_ccy}→{to_ccy} ({start_date} → {end_date})")
+        return pair_cache
+
+    # Fetch from API
+    try:
+        url = (
+            f"https://api.frankfurter.app/"
+            f"{start_date}..{end_date}"
+            f"?from={from_ccy}&to={to_ccy}"
+        )
+        log(f"   🌐 Fetching FX: {from_ccy}→{to_ccy} ({start_date} → {end_date}) ...")
+
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "moomoo_api_export/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        rates = data.get("rates", {})
+        for date_str, rate_dict in rates.items():
+            r = rate_dict.get(to_ccy)
+            if r:
+                pair_cache[date_str] = float(r)
+
+        _save_fx_cache()
+        log(f"   ✅ Cached {len(rates)} FX data points for {from_ccy}→{to_ccy}")
+
+    except Exception as e:
+        log(f"   ⚠️ FX fetch failed: {e}")
+
+    return pair_cache
+
+
+def get_fx_rate_on_date(date_str, from_ccy, to_ccy, fallback_rate):
+    """
+    Get FX rate for a specific date.
+    Falls back to nearest earlier weekday (up to 7 days back), then fallback_rate.
+    """
+    from_ccy = from_ccy.upper()
+    to_ccy = to_ccy.upper()
+
+    if from_ccy == to_ccy:
+        return 1.0
+
+    cache = _load_fx_cache()
+    pair_cache = cache.get(_fx_pair_key(from_ccy, to_ccy), {})
+
+    if not pair_cache or not date_str:
+        return fallback_rate
+
+    # Exact match
+    if date_str in pair_cache:
+        return pair_cache[date_str]
+
+    # Fallback: search earlier dates (weekends, holidays)
+    try:
+        target = datetime.strptime(date_str[:10], "%Y-%m-%d")
+    except Exception:
+        return fallback_rate
+
+    for delta in range(1, 15):
+        prev_str = (target - timedelta(days=delta)).strftime("%Y-%m-%d")
+        if prev_str in pair_cache:
+            return pair_cache[prev_str]
+
+    # Also try forward (in case start of range)
+    for delta in range(1, 15):
+        next_str = (target + timedelta(days=delta)).strftime("%Y-%m-%d")
+        if next_str in pair_cache:
+            return pair_cache[next_str]
+
+    return fallback_rate
+
+
+def convert_to_sgd_on_date(amount, currency, date_str,
+                            usd_to_sgd_fixed, hkd_to_sgd_fixed,
+                            use_historical=True):
+    """Convert amount to SGD using historical FX if available, else fixed."""
+    currency = safe_str(currency).upper()
+
+    if currency == "SGD" or amount == 0:
+        return amount
+
+    if not use_historical:
+        if currency == "USD":
+            return amount * usd_to_sgd_fixed
+        if currency == "HKD":
+            return amount * hkd_to_sgd_fixed
+        return amount
+
+    if currency == "USD":
+        rate = get_fx_rate_on_date(date_str, "USD", "SGD", usd_to_sgd_fixed)
+        return amount * rate
+    if currency == "HKD":
+        rate = get_fx_rate_on_date(date_str, "HKD", "SGD", hkd_to_sgd_fixed)
+        return amount * rate
+
+    return amount
+
+
+def prefetch_fx_for_range(start_date, end_date, log=print):
+    """Pre-fetch USD→SGD and HKD→SGD for the entire date range (incl. today for positions)."""
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    actual_end = max(end_date, today_str)
+
+    log("📡 Pre-fetching historical FX rates...")
+    fetch_historical_fx_range(start_date, actual_end, "USD", "SGD", log=log)
+    fetch_historical_fx_range(start_date, actual_end, "HKD", "SGD", log=log)
 
 
 # ============================================================
@@ -174,11 +347,8 @@ def parse_option_code(code):
         strike = 0
 
     return {
-        "underlying": underlying,
-        "expiry": expiry,
-        "put_call": put_call,
-        "strike": strike,
-        "dte": dte,
+        "underlying": underlying, "expiry": expiry,
+        "put_call": put_call, "strike": strike, "dte": dte,
     }
 
 
@@ -241,11 +411,14 @@ def fetch_positions(trade_ctx, acc_id, trd_env):
     return df
 
 
-def normalize_positions(pos_df, usd_to_sgd, hkd_to_sgd):
+def normalize_positions(pos_df, usd_to_sgd, hkd_to_sgd, use_historical=True):
+    """Positions use TODAY's FX rate."""
     if pos_df is None or pos_df.empty:
         return pd.DataFrame(columns=UNIFIED_POSITIONS_COLS)
 
+    today_str = datetime.now().strftime("%Y-%m-%d")
     rows = []
+
     for _, row in pos_df.iterrows():
         code = get_value(row, ["code", "stock_code", "symbol"], "")
         name = get_value(row, ["stock_name", "name", "description"], "")
@@ -263,9 +436,15 @@ def normalize_positions(pos_df, usd_to_sgd, hkd_to_sgd):
         unrealized_pnl = safe_float(get_value(row, ["unrealized_pl", "pl_val", "unrealized_pnl"], 0))
         realized_pnl = safe_float(get_value(row, ["realized_pl", "realized_pnl"], 0))
 
-        position_value_sgd = convert_to_sgd(position_value, currency, usd_to_sgd, hkd_to_sgd)
-        unrealized_pnl_sgd = convert_to_sgd(unrealized_pnl, currency, usd_to_sgd, hkd_to_sgd)
-        realized_pnl_sgd = convert_to_sgd(realized_pnl, currency, usd_to_sgd, hkd_to_sgd)
+        position_value_sgd = convert_to_sgd_on_date(
+            position_value, currency, today_str, usd_to_sgd, hkd_to_sgd, use_historical
+        )
+        unrealized_pnl_sgd = convert_to_sgd_on_date(
+            unrealized_pnl, currency, today_str, usd_to_sgd, hkd_to_sgd, use_historical
+        )
+        realized_pnl_sgd = convert_to_sgd_on_date(
+            realized_pnl, currency, today_str, usd_to_sgd, hkd_to_sgd, use_historical
+        )
 
         opt = parse_option_code(symbol)
         if opt:
@@ -347,7 +526,7 @@ def fetch_history_deals(trade_ctx, acc_id, trd_env, start_date, end_date):
 
 
 # ============================================================
-# ORDER FEES (Commission)
+# ORDER FEES
 # ============================================================
 def fetch_order_fees(trade_ctx, acc_id, trd_env, order_ids, log=print):
     fees = {}
@@ -380,9 +559,7 @@ def fetch_order_fees(trade_ctx, acc_id, trd_env, order_ids, log=print):
             for _, row in df.iterrows():
                 oid = safe_str(get_value(row, ["order_id", "orderID"], ""))
                 fee = safe_float(get_value(
-                    row,
-                    ["fee_amount", "fee_value", "total_fee", "commission", "fee"],
-                    0,
+                    row, ["fee_amount", "fee_value", "total_fee", "commission", "fee"], 0,
                 ))
                 if oid:
                     fees[oid] = fees.get(oid, 0) + fee
@@ -393,21 +570,13 @@ def fetch_order_fees(trade_ctx, acc_id, trd_env, order_ids, log=print):
 
 
 # ============================================================
-# ⭐ CASH FLOW (Deposits / Dividends / Tax / Fees)
+# CASH FLOW
 # ============================================================
 def fetch_cash_flow(trade_ctx, acc_id, trd_env, start_date, end_date, log=print):
-    """
-    Loop through each day and call get_acc_cash_flow / acc_cash_flow_query.
-
-    ⚠️ Rate limit: 10 requests / 30s per acc_id → throttle with sleep.
-    ⚠️ SIMULATE accounts not supported.
-    ⚠️ moomoo US accounts may also not support — function returns gracefully.
-    """
     if trd_env == ft.TrdEnv.SIMULATE:
         log("⚠️ Cash flow API does not support SIMULATE — skipped.")
         return pd.DataFrame()
 
-    # Find available API method name (varies by version)
     func_name = None
     for cand in ["get_acc_cash_flow", "acc_cash_flow_query"]:
         if hasattr(trade_ctx, cand):
@@ -429,7 +598,6 @@ def fetch_cash_flow(trade_ctx, acc_id, trd_env, start_date, end_date, log=print)
 
     all_rows = []
     days = (end_dt - start_dt).days + 1
-
     log(f"🔍 Fetching cash flow for {days} days ...")
     log(f"   (rate-limited: ~{CASH_FLOW_SLEEP}s/day, est. {days * CASH_FLOW_SLEEP / 60:.1f} min)")
 
@@ -451,17 +619,19 @@ def fetch_cash_flow(trade_ctx, acc_id, trd_env, start_date, end_date, log=print)
 
             if ret == ft.RET_OK:
                 if df is not None and not df.empty:
+                    # Tag every row with its clearing_date (some versions might not include it)
+                    if "clearing_date" not in df.columns:
+                        df = df.copy()
+                        df["clearing_date"] = date_str
                     all_rows.append(df)
                     success_count += 1
                 consecutive_unsupported = 0
-
             else:
                 msg = safe_str(df).lower()
-                if "unknown protocol" in msg or "not support" in msg or "unsupported" in msg:
+                if any(k in msg for k in ["unknown protocol", "not support", "unsupported"]):
                     consecutive_unsupported += 1
                     if consecutive_unsupported >= 3:
-                        log(f"⚠️ Cash flow API not supported for this account — aborting after 3 failures.")
-                        log(f"   (moomoo US accounts often don't support cash flow query)")
+                        log("⚠️ Cash flow API not supported for this account — aborting.")
                         break
                 fail_count += 1
 
@@ -469,14 +639,11 @@ def fetch_cash_flow(trade_ctx, acc_id, trd_env, start_date, end_date, log=print)
             fail_count += 1
             log(f"⚠️ {date_str}: {e}")
 
-        # Progress every 30 days
-        if (success_count + fail_count) % 30 == 0 and (success_count + fail_count) > 0:
+        if (success_count + fail_count) > 0 and (success_count + fail_count) % 30 == 0:
             log(f"   ... processed {success_count + fail_count}/{days} days "
                 f"(found data on {success_count}, failed {fail_count})")
 
         cur += timedelta(days=1)
-
-        # ⭐ Rate limit
         if cur <= end_dt:
             time.sleep(CASH_FLOW_SLEEP)
 
@@ -485,45 +652,36 @@ def fetch_cash_flow(trade_ctx, acc_id, trd_env, start_date, end_date, log=print)
         return pd.DataFrame()
 
     combined = pd.concat(all_rows, ignore_index=True)
-    log(f"✅ Cash flow rows retrieved: {len(combined)} (across {success_count} days with data)")
+    log(f"✅ Cash flow rows retrieved: {len(combined)}")
     return combined
 
 
 def categorize_cashflow(cf_type, cf_remark):
-    """
-    Classify a single cash flow row.
-    Returns one of: 'deposit', 'dividend', 'withholding_tax', 'fee', 'other'
-    """
     text = f"{safe_str(cf_type)} {safe_str(cf_remark)}".upper()
 
-    # Withholding tax (must check BEFORE dividend, since "Dividend Tax" contains "DIVIDEND")
     if any(k in text for k in [
         "WITHHOLD", "WITHHOLDING TAX", "DIVIDEND TAX", "TAX ON DIVIDEND",
         "预扣税", "預扣稅", "股息税", "股息稅",
     ]):
         return "withholding_tax"
 
-    # Dividend
     if any(k in text for k in [
         "DIVIDEND", "DIV", "股息", "派息", "紅利", "红利",
     ]):
         return "dividend"
 
-    # Deposit (inflow only)
     if any(k in text for k in [
         "DEPOSIT", "FUNDS TRANSFER IN", "TRANSFER IN", "FUND IN",
         "存入", "入金", "存款", "转入", "轉入",
     ]):
         return "deposit"
 
-    # Withdrawal
     if any(k in text for k in [
         "WITHDRAW", "WITHDRAWAL", "FUNDS TRANSFER OUT", "TRANSFER OUT", "FUND OUT",
         "提取", "出金", "转出", "轉出",
     ]):
         return "withdrawal"
 
-    # Fees / commissions / interest
     if any(k in text for k in [
         "COMMISSION", "PLATFORM FEE", "SETTLEMENT FEE", "REGULATORY FEE",
         "CLEARING FEE", "TRADING ACTIVITY FEE", "SEC FEE", "AUDIT FEE",
@@ -536,18 +694,12 @@ def categorize_cashflow(cf_type, cf_remark):
     return "other"
 
 
-def aggregate_cash_summary(cash_flow_df, usd_to_sgd, hkd_to_sgd):
-    """
-    Aggregate raw cash flow DataFrame into summary dict (all in SGD).
-    """
+def aggregate_cash_summary(cash_flow_df, usd_to_sgd, hkd_to_sgd, use_historical=True):
+    """Aggregate raw cash flow with date-aware FX conversion."""
     result = {
-        "deposits": 0.0,
-        "withdrawals": 0.0,
-        "dividends": 0.0,
-        "withholding_tax": 0.0,
-        "net_dividends": 0.0,
-        "fees": 0.0,
-        "other": 0.0,
+        "deposits": 0.0, "withdrawals": 0.0, "dividends": 0.0,
+        "withholding_tax": 0.0, "net_dividends": 0.0,
+        "fees": 0.0, "other": 0.0,
     }
 
     if cash_flow_df is None or cash_flow_df.empty:
@@ -558,8 +710,11 @@ def aggregate_cash_summary(cash_flow_df, usd_to_sgd, hkd_to_sgd):
         currency = safe_str(get_value(row, ["currency"], "USD")).upper()
         cf_type = safe_str(get_value(row, ["cashflow_type", "type"], ""))
         cf_remark = safe_str(get_value(row, ["cashflow_remark", "remark"], ""))
+        date_str = safe_str(get_value(row, ["clearing_date", "settlement_date"], ""))
 
-        amt_sgd = convert_to_sgd(amt, currency, usd_to_sgd, hkd_to_sgd)
+        amt_sgd = convert_to_sgd_on_date(
+            amt, currency, date_str, usd_to_sgd, hkd_to_sgd, use_historical
+        )
         category = categorize_cashflow(cf_type, cf_remark)
 
         if category == "deposit" and amt_sgd > 0:
@@ -580,9 +735,9 @@ def aggregate_cash_summary(cash_flow_df, usd_to_sgd, hkd_to_sgd):
 
 
 # ============================================================
-# NORMALIZE TRADES (no FIFO — dashboard will compute)
+# NORMALIZE TRADES (with date-aware FX)
 # ============================================================
-def normalize_trades(deal_df, usd_to_sgd, hkd_to_sgd, order_fees=None):
+def normalize_trades(deal_df, usd_to_sgd, hkd_to_sgd, order_fees=None, use_historical=True):
     if deal_df is None or deal_df.empty:
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
 
@@ -621,6 +776,13 @@ def normalize_trades(deal_df, usd_to_sgd, hkd_to_sgd, order_fees=None):
 
         asset_class = "OPT" if is_opt else infer_asset_class(code, name)
 
+        # ⭐ Get historical FX rate for this trade date
+        if currency == "USD":
+            usd_rate_for_row = get_fx_rate_on_date(trade_date, "USD", "SGD", usd_to_sgd) \
+                if use_historical else usd_to_sgd
+        else:
+            usd_rate_for_row = ""
+
         rows.append({
             "Platform": "Moomoo",
             "TradeDate": trade_date,
@@ -637,7 +799,7 @@ def normalize_trades(deal_df, usd_to_sgd, hkd_to_sgd, order_fees=None):
             "Commission": commission,
             "RealizedPnL": "",
             "RealizedPnLSgd": "",
-            "UsdToSgd": usd_to_sgd if currency == "USD" else "",
+            "UsdToSgd": usd_rate_for_row,
         })
 
     df = pd.DataFrame(rows, columns=UNIFIED_TRADES_COLS)
@@ -650,7 +812,8 @@ def normalize_trades(deal_df, usd_to_sgd, hkd_to_sgd, order_fees=None):
 # ============================================================
 def write_statement_csv(out_path, acc_info_df, positions_df, trades_df,
                         cash_summary, cash_flow_raw_df,
-                        start_date, end_date, usd_to_sgd, hkd_to_sgd):
+                        start_date, end_date, usd_to_sgd, hkd_to_sgd,
+                        use_historical_fx):
     with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
 
@@ -659,6 +822,7 @@ def write_statement_csv(out_path, acc_info_df, positions_df, trades_df,
         w.writerow(["DateRange", f"{start_date} → {end_date}"])
         w.writerow(["UsdToSgd", usd_to_sgd])
         w.writerow(["HkdToSgd", hkd_to_sgd])
+        w.writerow(["FxMode", "Historical" if use_historical_fx else "Fixed"])
         w.writerow([])
 
         # [Account Overview]
@@ -669,7 +833,7 @@ def write_statement_csv(out_path, acc_info_df, positions_df, trades_df,
             w.writerow(["No account info."])
         w.writerow([])
 
-        # ⭐ [Cash Summary]
+        # [Cash Summary]
         w.writerow(["[Cash Summary]"])
         w.writerow(["Item", "Amount(SGD)"])
         w.writerow(["Deposits", round(cash_summary.get("deposits", 0), 2)])
@@ -681,7 +845,7 @@ def write_statement_csv(out_path, acc_info_df, positions_df, trades_df,
         w.writerow(["Other", round(cash_summary.get("other", 0), 2)])
         w.writerow([])
 
-        # ⭐ [Cash Flow Raw] (for audit)
+        # [Cash Flow Raw]
         w.writerow(["[Cash Flow Raw]"])
         if cash_flow_raw_df is not None and not cash_flow_raw_df.empty:
             cash_flow_raw_df.to_csv(f, index=False, lineterminator="\n")
@@ -710,8 +874,9 @@ def write_statement_csv(out_path, acc_info_df, positions_df, trades_df,
 # ============================================================
 def run_export(acc_id, start_date, end_date, usd_to_sgd, hkd_to_sgd,
                out_dir, host=DEFAULT_HOST, port=DEFAULT_PORT,
-               include_today=False, unlock_pw=None,
+               unlock_pw=None,
                fetch_cash_flow_enabled=True,
+               use_historical_fx=True,
                log_callback=print):
 
     log_callback("====================================")
@@ -719,11 +884,20 @@ def run_export(acc_id, start_date, end_date, usd_to_sgd, hkd_to_sgd,
     log_callback("====================================")
     log_callback(f"Acc ID     : {acc_id}")
     log_callback(f"Date Range : {start_date} → {end_date} (inclusive)")
-    log_callback(f"USDSGD     : {usd_to_sgd}")
-    log_callback(f"HKDSGD     : {hkd_to_sgd}")
+    log_callback(f"USDSGD fix : {usd_to_sgd}")
+    log_callback(f"HKDSGD fix : {hkd_to_sgd}")
+    log_callback(f"FX Mode    : {'HISTORICAL (frankfurter.app)' if use_historical_fx else 'FIXED'}")
     log_callback(f"Cash Flow  : {'ENABLED' if fetch_cash_flow_enabled else 'DISABLED'}")
     log_callback(f"Output Dir : {out_dir}")
     log_callback("====================================")
+
+    # ⭐ Pre-fetch FX rates (one API call for entire range)
+    if use_historical_fx:
+        try:
+            prefetch_fx_for_range(start_date, end_date, log=log_callback)
+        except Exception as e:
+            log_callback(f"⚠️ FX prefetch failed, falling back to fixed: {e}")
+            use_historical_fx = False
 
     trade_ctx = ft.OpenSecTradeContext(host=host, port=port)
 
@@ -739,10 +913,12 @@ def run_export(acc_id, start_date, end_date, usd_to_sgd, hkd_to_sgd,
         acc_info_df = fetch_account_info(trade_ctx, chosen_acc_id, trd_env)
         log_callback(f"✅ Account info rows: {len(acc_info_df)}")
 
-        # Positions
+        # Positions (use today's FX)
         pos_raw = fetch_positions(trade_ctx, chosen_acc_id, trd_env)
         log_callback(f"✅ Positions raw rows: {len(pos_raw)}")
-        positions_df = normalize_positions(pos_raw, usd_to_sgd, hkd_to_sgd)
+        positions_df = normalize_positions(
+            pos_raw, usd_to_sgd, hkd_to_sgd, use_historical=use_historical_fx
+        )
 
         # History deals
         hist_df = fetch_history_deals(trade_ctx, chosen_acc_id, trd_env, start_date, end_date)
@@ -756,7 +932,7 @@ def run_export(acc_id, start_date, end_date, usd_to_sgd, hkd_to_sgd,
                           if c in combined.columns]
             combined = combined.drop_duplicates(subset=dedup_cols) if dedup_cols else combined.drop_duplicates()
 
-        # Order fees → commission
+        # Order fees
         order_fees = {}
         if not combined.empty and "order_id" in combined.columns:
             unique_oids = combined["order_id"].astype(str).unique().tolist()
@@ -766,20 +942,25 @@ def run_export(acc_id, start_date, end_date, usd_to_sgd, hkd_to_sgd,
             )
             log_callback(f"✅ Fees retrieved for {len(order_fees)} orders")
 
-        trades_df = normalize_trades(combined, usd_to_sgd, hkd_to_sgd, order_fees=order_fees)
+        # Trades (use trade date FX)
+        trades_df = normalize_trades(
+            combined, usd_to_sgd, hkd_to_sgd,
+            order_fees=order_fees, use_historical=use_historical_fx
+        )
 
-        # ⭐ Cash flow (deposits / dividends / tax / fees)
+        # Cash flow
         if fetch_cash_flow_enabled:
             cash_flow_raw = fetch_cash_flow(
-                trade_ctx, chosen_acc_id, trd_env,
-                start_date, end_date,
-                log=log_callback,
+                trade_ctx, chosen_acc_id, trd_env, start_date, end_date, log=log_callback,
             )
         else:
-            log_callback("⚠️ Cash flow fetch DISABLED — Deposits/Dividends/Tax/Fees will be 0.")
+            log_callback("⚠️ Cash flow fetch DISABLED.")
             cash_flow_raw = pd.DataFrame()
 
-        cash_summary = aggregate_cash_summary(cash_flow_raw, usd_to_sgd, hkd_to_sgd)
+        # Aggregate (use clearing_date FX)
+        cash_summary = aggregate_cash_summary(
+            cash_flow_raw, usd_to_sgd, hkd_to_sgd, use_historical=use_historical_fx
+        )
 
         log_callback("\n📊 Cash Summary (SGD):")
         log_callback(f"   Deposits      : ${cash_summary['deposits']:>12,.2f}")
@@ -790,7 +971,7 @@ def run_export(acc_id, start_date, end_date, usd_to_sgd, hkd_to_sgd,
         log_callback(f"   Fees          : ${cash_summary['fees']:>12,.2f}")
         log_callback(f"   Other         : ${cash_summary['other']:>12,.2f}")
 
-        # Save file
+        # Save
         start_tag = start_date.replace("-", "")
         end_tag = end_date.replace("-", "")
         filename = f"moomoo_statement({start_tag}-{end_tag}).csv"
@@ -800,13 +981,13 @@ def run_export(acc_id, start_date, end_date, usd_to_sgd, hkd_to_sgd,
             out_path, acc_info_df, positions_df, trades_df,
             cash_summary, cash_flow_raw,
             start_date, end_date, usd_to_sgd, hkd_to_sgd,
+            use_historical_fx,
         )
 
         log_callback(f"\n✅ Saved: {os.path.abspath(out_path)}")
         log_callback(f"   Holdings : {len(positions_df)} rows")
         log_callback(f"   Trades   : {len(trades_df)} rows")
         log_callback(f"   CashFlow : {len(cash_flow_raw)} rows")
-        log_callback(f"   ℹ️ Trades RealizedPnL left blank — FIFO will run in dashboard.")
 
         return out_path
 
@@ -816,13 +997,13 @@ def run_export(acc_id, start_date, end_date, usd_to_sgd, hkd_to_sgd,
 
 
 # ============================================================
-# GUI (Simplified)
+# GUI
 # ============================================================
 class MoomooGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Moomoo Statement Export")
-        self.geometry("580x600")
+        self.geometry("600x680")
         self.resizable(False, False)
 
         pad = {"padx": 10, "pady": 6}
@@ -849,11 +1030,11 @@ class MoomooGUI(tk.Tk):
                   foreground="gray").grid(row=3, column=1, sticky="w", padx=10)
 
         # FX rates
-        ttk.Label(self, text="USD → SGD:").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Label(self, text="USD → SGD (fallback):").grid(row=4, column=0, sticky="w", **pad)
         self.usdsgd_var = tk.StringVar(value=str(DEFAULT_USDSGD))
         ttk.Entry(self, textvariable=self.usdsgd_var, width=44).grid(row=4, column=1, **pad)
 
-        ttk.Label(self, text="HKD → SGD:").grid(row=5, column=0, sticky="w", **pad)
+        ttk.Label(self, text="HKD → SGD (fallback):").grid(row=5, column=0, sticky="w", **pad)
         self.hkdsgd_var = tk.StringVar(value=str(DEFAULT_HKDSGD))
         ttk.Entry(self, textvariable=self.hkdsgd_var, width=44).grid(row=5, column=1, **pad)
 
@@ -865,10 +1046,20 @@ class MoomooGUI(tk.Tk):
         ttk.Entry(frm, textvariable=self.outdir_var, width=34).pack(side="left")
         ttk.Button(frm, text="...", command=self.choose_dir, width=4).pack(side="left", padx=4)
 
-        # ⭐ Cash Flow toggle
+        # ⭐ Historical FX toggle
+        self.histfx_var = tk.BooleanVar(value=True)
+        fx_frame = ttk.Frame(self)
+        fx_frame.grid(row=7, column=1, sticky="w", **pad)
+        ttk.Checkbutton(
+            fx_frame,
+            text="Use historical FX rates (frankfurter.app, cached)",
+            variable=self.histfx_var,
+        ).pack(side="left")
+
+        # Cash Flow toggle
         self.cashflow_var = tk.BooleanVar(value=True)
         cf_frame = ttk.Frame(self)
-        cf_frame.grid(row=7, column=1, sticky="w", **pad)
+        cf_frame.grid(row=8, column=1, sticky="w", **pad)
         ttk.Checkbutton(
             cf_frame,
             text="Fetch Cash Flow (Deposits/Dividends/Tax/Fees)",
@@ -880,21 +1071,25 @@ class MoomooGUI(tk.Tk):
             text="(Cash flow query is rate-limited ~3s/day → 365 days ≈ 18min)",
             foreground="gray",
             font=("Consolas", 8),
-        ).grid(row=8, column=1, sticky="w", padx=10)
+        ).grid(row=9, column=1, sticky="w", padx=10)
 
         # Export button
-        ttk.Button(self, text="Export Statement", command=self.on_export).grid(
-            row=9, column=0, columnspan=2, pady=12
-        )
+        self.export_btn = ttk.Button(self, text="Export Statement", command=self.on_export)
+        self.export_btn.grid(row=10, column=0, columnspan=2, pady=12)
 
         # Log
-        self.log_text = tk.Text(self, height=15, width=68, font=("Consolas", 9))
-        self.log_text.grid(row=10, column=0, columnspan=2, padx=10, pady=8)
+        self.log_text = tk.Text(self, height=17, width=70, font=("Consolas", 9))
+        self.log_text.grid(row=11, column=0, columnspan=2, padx=10, pady=8)
+
+        self._worker = None
 
     def log(self, msg):
         self.log_text.insert("end", str(msg) + "\n")
         self.log_text.see("end")
         self.update_idletasks()
+
+    def safe_log(self, msg):
+        self.after(0, lambda: self.log(msg))
 
     def choose_dir(self):
         d = filedialog.askdirectory(initialdir=self.outdir_var.get())
@@ -902,6 +1097,10 @@ class MoomooGUI(tk.Tk):
             self.outdir_var.set(d)
 
     def on_export(self):
+        if self._worker is not None and self._worker.is_alive():
+            messagebox.showinfo("Already running", "An export is already in progress.")
+            return
+
         try:
             acc_id = self.acc_var.get().strip()
             start_date = self.start_var.get().strip()
@@ -910,6 +1109,7 @@ class MoomooGUI(tk.Tk):
             hkd_to_sgd = float(self.hkdsgd_var.get().strip())
             out_dir = self.outdir_var.get().strip()
             cashflow_enabled = self.cashflow_var.get()
+            histfx_enabled = self.histfx_var.get()
 
             datetime.strptime(start_date, "%Y-%m-%d")
             datetime.strptime(end_date, "%Y-%m-%d")
@@ -918,22 +1118,31 @@ class MoomooGUI(tk.Tk):
             return
 
         self.log_text.delete("1.0", "end")
+        self.export_btn.config(state="disabled", text="Exporting...")
 
-        try:
-            out_path = run_export(
-                acc_id=acc_id,
-                start_date=start_date,
-                end_date=end_date,
-                usd_to_sgd=usd_to_sgd,
-                hkd_to_sgd=hkd_to_sgd,
-                out_dir=out_dir,
-                fetch_cash_flow_enabled=cashflow_enabled,
-                log_callback=self.log,
-            )
-            messagebox.showinfo("Success", f"Saved:\n{out_path}")
-        except Exception as e:
-            self.log(f"\n❌ Error: {e}")
-            messagebox.showerror("Export failed", str(e))
+        def worker():
+            try:
+                out_path = run_export(
+                    acc_id=acc_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    usd_to_sgd=usd_to_sgd,
+                    hkd_to_sgd=hkd_to_sgd,
+                    out_dir=out_dir,
+                    fetch_cash_flow_enabled=cashflow_enabled,
+                    use_historical_fx=histfx_enabled,
+                    log_callback=self.safe_log,
+                )
+                self.after(0, lambda: messagebox.showinfo("Success", f"Saved:\n{out_path}"))
+            except Exception as e:
+                err = str(e)
+                self.after(0, lambda: self.safe_log(f"\n❌ Error: {err}"))
+                self.after(0, lambda: messagebox.showerror("Export failed", err))
+            finally:
+                self.after(0, lambda: self.export_btn.config(state="normal", text="Export Statement"))
+
+        self._worker = threading.Thread(target=worker, daemon=True)
+        self._worker.start()
 
 
 # ============================================================

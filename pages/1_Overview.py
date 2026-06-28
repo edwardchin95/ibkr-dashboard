@@ -137,7 +137,8 @@ tiger_loaded = tiger_load_latest_snapshot()
 moomoo_loaded = moomoo_load_latest_snapshot()
 
 # IBKR data
-ibkr_nav = ibkr_cash = ibkr_pnl = ibkr_deposit = 0
+ibkr_nav = ibkr_cash = ibkr_pnl = 0
+ibkr_deposit = ibkr_withdrawal = ibkr_other = 0
 ibkr_positions = pd.DataFrame()
 ibkr_history = pd.DataFrame()
 
@@ -148,9 +149,12 @@ if ibkr_loaded is not None:
     ibkr_cash = float(ibkr_loaded["cash"])
     ibkr_pnl = float(ibkr_loaded["pnl"])
     ibkr_deposit = float(ibkr_loaded["deposit"])
+    ibkr_withdrawal = float(ibkr_loaded.get("withdrawal", 0))
+    ibkr_other = float(ibkr_loaded.get("other", 0))
 
 # Tiger data
-tiger_nav = tiger_cash_v = tiger_pnl = tiger_deposit = 0
+tiger_nav = tiger_cash_v = tiger_pnl = 0
+tiger_deposit = tiger_withdrawal = tiger_other = 0
 tiger_positions = pd.DataFrame()
 tiger_history = pd.DataFrame()
 
@@ -161,9 +165,12 @@ if tiger_loaded is not None:
     tiger_cash_v = float(tiger_loaded["cash"])
     tiger_pnl = float(tiger_loaded["pnl"])
     tiger_deposit = float(tiger_loaded["deposit"])
+    tiger_withdrawal = float(tiger_loaded.get("withdrawal", 0))
+    tiger_other = float(tiger_loaded.get("other", 0))
 
 # Moomoo data
-moomoo_nav = moomoo_cash_v = moomoo_pnl = moomoo_deposit = 0
+moomoo_nav = moomoo_cash_v = moomoo_pnl = 0
+moomoo_deposit = moomoo_withdrawal = moomoo_other = 0
 moomoo_positions = pd.DataFrame()
 moomoo_history = pd.DataFrame()
 
@@ -174,6 +181,8 @@ if moomoo_loaded is not None:
     moomoo_cash_v = float(moomoo_loaded["cash"])
     moomoo_pnl = float(moomoo_loaded["pnl"])
     moomoo_deposit = float(moomoo_loaded["deposit"])
+    moomoo_withdrawal = float(moomoo_loaded.get("withdrawal", 0))
+    moomoo_other = float(moomoo_loaded.get("other", 0))
 
 # ============================================================
 # APPLY PLATFORM FILTER
@@ -185,6 +194,8 @@ if platform_filter == "IBKR":
     cash_sgd = ibkr_cash
     real_pnl = ibkr_pnl
     total_deposit = ibkr_deposit
+    total_withdrawal = ibkr_withdrawal
+    total_other = ibkr_other
 
 elif platform_filter == "Tiger":
     df_positions = tiger_positions
@@ -193,6 +204,8 @@ elif platform_filter == "Tiger":
     cash_sgd = tiger_cash_v
     real_pnl = tiger_pnl
     total_deposit = tiger_deposit
+    total_withdrawal = tiger_withdrawal
+    total_other = tiger_other
 
 elif platform_filter == "Moomoo":
     df_positions = moomoo_positions
@@ -201,6 +214,8 @@ elif platform_filter == "Moomoo":
     cash_sgd = moomoo_cash_v
     real_pnl = moomoo_pnl
     total_deposit = moomoo_deposit
+    total_withdrawal = moomoo_withdrawal
+    total_other = moomoo_other
 
 else:  # All
     frames_pos = [d for d in [ibkr_positions, tiger_positions, moomoo_positions] if not d.empty]
@@ -213,6 +228,11 @@ else:  # All
     cash_sgd = ibkr_cash + tiger_cash_v + moomoo_cash_v
     real_pnl = ibkr_pnl + tiger_pnl + moomoo_pnl
     total_deposit = ibkr_deposit + tiger_deposit + moomoo_deposit
+    total_withdrawal = ibkr_withdrawal + tiger_withdrawal + moomoo_withdrawal
+    total_other = ibkr_other + tiger_other + moomoo_other
+
+# ⭐ Net Capital = Deposit + Withdrawal (withdrawal is negative)
+net_capital = total_deposit + total_withdrawal
 
 # ============================================================
 # PREVIOUS NAV (跟 filter 走)
@@ -248,7 +268,7 @@ nav_pct = (nav_change / previous_nav * 100) if previous_nav != 0 else 0
 # ============================================================
 # PORTFOLIO RETURN
 # ============================================================
-portfolio_return = total_nav - total_deposit
+portfolio_return = total_nav - net_capital
 
 # ============================================================
 # REALIZED PROFIT / LOSS (按 filter)
@@ -289,6 +309,7 @@ st.subheader(f"账户总览 PORTFOLIO OVERVIEW{filter_label}")
 portfolio_color = "#66FF99" if portfolio_return >= 0 else "#FF6666"
 change_color = "#66FF99" if nav_change >= 0 else "#FF6666"
 pnl_color = "#66FF99" if real_pnl >= 0 else "#FF6666"
+nc_color = "#66FF99" if net_capital >= 0 else "#FF6666"
 
 progress = 0
 if target_nav != 0:
@@ -319,9 +340,9 @@ SGD ${real_pnl:,.2f}
 </div>
 
 <div>
-<div style='color:gray; font-size:13px;'>Total Deposit</div>
-<div style='color:white; font-size:24px; font-weight:bold;'>
-SGD ${total_deposit:,.2f}
+<div style='color:gray; font-size:13px;'>Net Capital</div>
+<div style='color:{nc_color}; font-size:24px; font-weight:bold;'>
+SGD ${net_capital:,.2f}
 </div>
 </div>
 
@@ -1249,7 +1270,10 @@ if show_ibkr_line or show_tiger_line or show_moomoo_line:
     if history_df is not None and not history_df.empty and "Timestamp" in history_df.columns:
         history_display = format_df(
             history_df.sort_values(by="Timestamp", ascending=False),
-            cols_2dp=["NAV", "Cash", "PnL", "TotalDeposit", "PeriodDeposit",
+            cols_2dp=["NAV", "Cash", "PnL",
+                    "TotalDeposit", "PeriodDeposit",
+                    "TotalWithdrawal", "PeriodWithdrawal",
+                    "TotalOther", "PeriodOther",
                     "Dividends", "WithholdingTax", "NetDividends", "Fees"],
             cols_3dp=["UsdToSgd"],
         )

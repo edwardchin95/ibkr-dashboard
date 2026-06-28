@@ -5,74 +5,30 @@ import re
 import csv as _csv
 from datetime import datetime, timedelta
 
-from app import SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR
+from app import (
+    SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR,
+    TRADES_HISTORY_FILE,
+    INDEX_ETFS,
+    TARGET_ETF_STOCK_TOTAL, TARGET_SINGLE_STOCK,
+    TARGET_OPTION_TOTAL, TARGET_CASH,
+    OPTION_TARGETS, OPTION_COLORS,
+    OPTION_MULTIPLIER,
+    DEFAULT_USDSGD, DEFAULT_HKDSGD,
+    UNIFIED_POSITIONS_COLS, UNIFIED_TRADES_COLS,
+    JOURNAL_COLS, UNIFIED_HISTORY_COLS,
+)
 
 
 # ============================================================
-# Constants
+# Moomoo-specific Constants
 # ============================================================
 
 MOOMOO_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "moomoo")
 os.makedirs(MOOMOO_SNAPSHOT_DIR, exist_ok=True)
 
-# Unified trades history shared by IBKR / Tiger / Moomoo
-TRADES_HISTORY_FILE = os.path.join(
-    os.path.dirname(HISTORY_FILE),
-    "trades_history.csv"
-)
-
-INDEX_ETFS = ["CSPX", "VOO", "VT", "QQQ", "QQQM", "BNDW", "SPY", "DIA", "IWM"]
-
-TARGET_ETF_STOCK_TOTAL = 60
-TARGET_SINGLE_STOCK = 10
-TARGET_OPTION_TOTAL = 20
-TARGET_CASH = 20
-
-OPTION_TARGETS = {
-    "Sell Put": 40, "Sell Call": 40, "LEAPS Call": 20,
-    "Long Call": 10, "Long Put": 10, "Other Options": 0
-}
-
-OPTION_COLORS = {
-    "Sell Put": "#4A7BFF", "Sell Call": "#00D4FF", "LEAPS Call": "#FFC300",
-    "Long Call": "#00D4AA", "Long Put": "#FF6666", "Other Options": "#9CA3AF"
-}
-
-OPTION_MULTIPLIER = 100
-
-DEFAULT_USDSGD = 1.34
-DEFAULT_HKDSGD = 0.17
-
-
-# ============================================================
-# Unified Schema
-# ============================================================
-
-UNIFIED_POSITIONS_COLS = [
-    "Platform", "Symbol", "Description", "AssetClass", "Currency",
-    "Quantity", "Multiplier", "CostPrice", "ClosePrice",
-    "PositionValue", "PositionValueSgd",
-    "UnrealizedPnL", "UnrealizedPnLSgd",
-    "UnderlyingSymbol", "Put/Call", "Strike", "Expiry", "DTE",
-]
-
-UNIFIED_TRADES_COLS = [
-    "Platform", "TradeDate", "Symbol", "Description", "AssetClass",
-    "Buy/Sell", "Quantity", "TradePrice", "Currency",
-    "Strategy", "Notes",
-    "NetCash", "Commission",
-    "RealizedPnL", "RealizedPnLSgd", "UsdToSgd",
-]
-
-JOURNAL_COLS = ["Strategy", "Notes"]
-
-UNIFIED_HISTORY_COLS = [
-    "Platform", "Timestamp", "SnapshotFile",
-    "NAV", "Cash", "PnL",
-    "TotalDeposit", "PeriodDeposit",
-    "Dividends", "WithholdingTax", "NetDividends", "Fees",
-    "UsdToSgd",
-]
+# ⭐ How many days after statement's end_date we still consider its
+# [Account Overview] snapshot to be "fresh"
+STATEMENT_FRESHNESS_DAYS = 7
 
 
 # ============================================================
@@ -219,11 +175,6 @@ def detect_moomoo_csv(file_obj_or_bytes):
 # ============================================================
 
 def _split_sections(text):
-    """
-    Split statement text into:
-      meta: dict (header info above first [Section])
-      sections: {section_name: list_of_lines}
-    """
     lines = text.splitlines()
     meta = {}
     sections = {}
@@ -259,7 +210,6 @@ def _split_sections(text):
 
 
 def _section_to_df(section_lines):
-    """Convert lines (with header row) to DataFrame."""
     if not section_lines:
         return pd.DataFrame()
     while section_lines and section_lines[-1].strip() == "":
@@ -277,15 +227,16 @@ def _section_to_df(section_lines):
 
 
 def _parse_statement(file_obj):
-    """Returns (meta, account_df, holdings_df, trades_df)."""
+    """Returns (meta, account_df, holdings_df, trades_df, cash_flow_raw_df)."""
     text = _read_text(file_obj)
     meta, sections = _split_sections(text)
 
     account_df = _section_to_df(sections.get("Account Overview", []))
     holdings_df = _section_to_df(sections.get("Holdings", []))
     trades_df = _section_to_df(sections.get("Trades", []))
+    cash_flow_raw_df = _section_to_df(sections.get("Cash Flow Raw", []))
 
-    return meta, account_df, holdings_df, trades_df
+    return meta, account_df, holdings_df, trades_df, cash_flow_raw_df
 
 
 # ============================================================
@@ -300,6 +251,44 @@ def _get_meta_fx(meta):
     if hkd == 0:
         hkd = DEFAULT_HKDSGD
     return usd, hkd
+
+
+def _is_statement_fresh(meta, max_days_stale=STATEMENT_FRESHNESS_DAYS):
+    """
+    ⭐ Check if statement's [Account Overview] data is "fresh".
+
+    Moomoo's accinfo_query always returns TODAY's account state, not historical
+    snapshots. So if a statement was GENERATED long after its DateRange ended,
+    the NAV/Cash/PnL data is just today's snapshot stamped with an old label.
+    """
+    generated_str = _safe_str(meta.get("GeneratedAt", ""))
+    date_range = _safe_str(meta.get("DateRange", ""))
+
+    if not generated_str or not date_range:
+        return True
+
+    try:
+        gen_dt = datetime.strptime(generated_str.split()[0], "%Y-%m-%d")
+    except:
+        return True
+
+    parts = re.split(r"\s*(?:→|->|—|–|to)\s*", date_range)
+    if len(parts) < 2:
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})\s*[-–—→]\s*(\d{4}-\d{2}-\d{2})$", date_range)
+        if m:
+            parts = [m.group(1), m.group(2)]
+        else:
+            return True
+
+    end_str = parts[1].strip()
+
+    try:
+        end_dt = datetime.strptime(end_str[:10], "%Y-%m-%d")
+    except:
+        return True
+
+    diff_days = (gen_dt - end_dt).days
+    return diff_days <= max_days_stale
 
 
 def _get_field(df, candidates, default=0):
@@ -329,7 +318,7 @@ def _get_field_str(df, candidates, default=""):
 def extract_nav_cash(account_df, usd_to_sgd, hkd_to_sgd, holdings_df=None):
     """
     Extract NAV (SGD), Cash (SGD) from accinfo_query result.
-    accinfo_query returns native currency (often USD for moomoo US account).
+    ⭐ Cash = native cash + fund_assets (MM Fund balance included)
     """
     if account_df is None or account_df.empty:
         if holdings_df is not None and not holdings_df.empty:
@@ -350,16 +339,24 @@ def extract_nav_cash(account_df, usd_to_sgd, hkd_to_sgd, holdings_df=None):
         0,
     )
 
+    fund_assets_native = _get_field(
+        account_df,
+        ["fund_assets", "fund_value", "fund_balance"],
+        0,
+    )
+
     base_currency = _safe_str(_get_field_str(account_df, ["currency", "Currency"], "USD"), "USD").upper()
 
     nav_sgd = _convert_to_sgd(nav_native, base_currency, usd_to_sgd, hkd_to_sgd)
     cash_sgd = _convert_to_sgd(cash_native, base_currency, usd_to_sgd, hkd_to_sgd)
+    fund_assets_sgd = _convert_to_sgd(fund_assets_native, base_currency, usd_to_sgd, hkd_to_sgd)
 
-    return float(nav_sgd), float(cash_sgd)
+    # ⭐ Cash includes MM Fund balance
+    total_cash_sgd = cash_sgd + fund_assets_sgd
+    return float(nav_sgd), float(total_cash_sgd)
 
 
 def extract_total_pnl(holdings_df):
-    """Total unrealized P&L (SGD) — sum of holdings UnrealizedPnLSgd."""
     if holdings_df is None or holdings_df.empty:
         return 0.0
     if "UnrealizedPnLSgd" in holdings_df.columns:
@@ -367,16 +364,143 @@ def extract_total_pnl(holdings_df):
     return 0.0
 
 
-def extract_period_deposit(meta):
-    """Moomoo statement doesn't track deposits — return 0."""
-    return 0.0
+# ============================================================
+# ⭐ CASHFLOW CATEGORIZATION
+# ============================================================
 
+def _categorize_cashflow(cf_type, cf_remark):
+    """
+    Classify a single cash flow row.
+    Returns one of: 'deposit', 'withdrawal', 'dividend',
+                    'withholding_tax', 'fee', 'other', 'ignore'
+    """
+    cf_type_s = _safe_str(cf_type)
+    cf_remark_s = _safe_str(cf_remark)
+    text = f"{cf_type_s} {cf_remark_s}".upper()
+    cf_type_upper = cf_type_s.upper()
+    remark_upper = cf_remark_s.upper()
+
+    # 1. Withholding tax (priority)
+    if any(k in text for k in [
+        "WITHHOLDING TAX", "DIVIDEND TAX", "TAX ON DIVIDEND",
+        "WITHHOLD",
+        "预扣税", "預扣稅", "股息税", "股息稅",
+    ]):
+        return "withholding_tax"
+
+    # 2. Dividend
+    if any(k in text for k in [
+        "CASH DIVIDEND", "DIVIDENDS",
+        "股息", "派息", "紅利", "红利",
+    ]):
+        return "dividend"
+    if cf_type_upper == "DIVIDEND":
+        return "dividend"
+
+    # 3. Bank Transfer
+    if "BANK TRANSFER WITHDRAW" in text:
+        return "withdrawal"
+    if "BANK TRANSFER DEPOSIT" in text or "BANK TRANSFER IN" in text:
+        return "deposit"
+
+    # 4. Stock Yield Program → other
+    if "STOCK YIELD" in text:
+        return "other"
+
+    # ⭐ 5. INTERNAL MOVEMENTS → ignore
+    if "CURRENCY EXCHANGE" in cf_type_upper:
+        return "ignore"
+    if "AUTO CURRENCY EXCHANGE" in cf_type_upper:
+        return "ignore"
+    if any(k in remark_upper for k in [
+        "TRANSFER FROM UNIVERSAL", "TRANSFER TO UNIVERSAL",
+        "TRANSFER TO US STOCKS ACCOUNT", "TRANSFER FROM US STOCKS",
+    ]):
+        return "ignore"
+    if "FUND SUBSCRIPTION" in text:
+        return "ignore"
+    if "FUND REDEMPTION" in text:
+        return "ignore"
+
+    # ⭐ 6. DEPOSIT IDENTIFICATION
+    deposit_keywords = [
+        "DDIIRGPC", "WISE_PAY", "DEPOSIT_OK",
+        "COUPON DEPOSIT", "ACCOUNT UPGRADE",
+    ]
+    if any(k in remark_upper for k in deposit_keywords):
+        return "deposit"
+
+    # 7. Fees
+    if any(k in text for k in [
+        "COMMISSION", "PLATFORM FEE", "SETTLEMENT FEE",
+        "REGULATORY FEE", "CLEARING FEE", "SEC FEE",
+        "TRANSACTION FEE", "EXCHANGE FEE",
+        "GST",
+        "手续费", "手續費", "佣金",
+    ]):
+        return "fee"
+
+    # ⭐ 8. USD/HKD "Others" → ignore (trade settlement)
+    if cf_type_s == "Others":
+        return "ignore"
+
+    return "other"
+
+
+def compute_cash_summary_from_raw(cash_flow_raw_df, usd_to_sgd, hkd_to_sgd):
+    """⭐ Re-classify [Cash Flow Raw] using our own logic. Returns dict (SGD)."""
+    result = {
+        "deposits": 0.0, "withdrawals": 0.0,
+        "dividends": 0.0, "withholding_tax": 0.0,
+        "net_dividends": 0.0, "fees": 0.0, "other": 0.0,
+        "stock_yield_income": 0.0,
+        "misc_other": 0.0,
+    }
+
+    if cash_flow_raw_df is None or cash_flow_raw_df.empty:
+        return result
+
+    if "cashflow_type" not in cash_flow_raw_df.columns:
+        return result
+
+    for _, row in cash_flow_raw_df.iterrows():
+        amt = _safe_float(row.get("cashflow_amount", 0))
+        currency = _safe_str(row.get("currency", "USD")).upper()
+        cf_type = _safe_str(row.get("cashflow_type", ""))
+        cf_remark = _safe_str(row.get("cashflow_remark", ""))
+
+        amt_sgd = _convert_to_sgd(amt, currency, usd_to_sgd, hkd_to_sgd)
+        category = _categorize_cashflow(cf_type, cf_remark)
+
+        if category == "deposit" and amt_sgd > 0:
+            result["deposits"] += amt_sgd
+        elif category == "withdrawal" and amt_sgd < 0:
+            result["withdrawals"] += amt_sgd
+        elif category == "dividend":
+            result["dividends"] += amt_sgd
+        elif category == "withholding_tax":
+            result["withholding_tax"] += amt_sgd
+        elif category == "fee":
+            result["fees"] += amt_sgd
+        elif category == "other":
+            result["other"] += amt_sgd
+            # ⭐ Sub-classify "other" into Stock Yield vs Misc
+            text = f"{cf_type} {cf_remark}".upper()
+            if "STOCK YIELD" in text:
+                result["stock_yield_income"] += amt_sgd
+            else:
+                result["misc_other"] += amt_sgd
+        # category == "ignore" → 跳过
+
+    result["net_dividends"] = result["dividends"] + result["withholding_tax"]
+    return result
+
+
+# ============================================================
+# EXTRACT REPORT DATE RANGE
+# ============================================================
 
 def extract_report_date_range(meta):
-    """
-    DateRange in meta is like '2025-01-01 → 2026-06-27'.
-    Returns (start_yyyy-mm-dd, end_yyyy-mm-dd) or (None, None).
-    """
     rng = meta.get("DateRange", "")
     if not rng:
         return None, None
@@ -399,7 +523,7 @@ def extract_report_date_range(meta):
 # ============================================================
 
 def parse_moomoo_csv(file_obj):
-    _, _, holdings_df, _ = _parse_statement(file_obj)
+    _, _, holdings_df, _, _ = _parse_statement(file_obj)
 
     if holdings_df is None or holdings_df.empty:
         return pd.DataFrame(columns=UNIFIED_POSITIONS_COLS)
@@ -412,7 +536,6 @@ def parse_moomoo_csv(file_obj):
 
     df = df[UNIFIED_POSITIONS_COLS]
 
-    # Recompute DTE for OPT (statement could be days old)
     if "AssetClass" in df.columns:
         for i, row in df.iterrows():
             if _safe_str(row["AssetClass"]).upper() == "OPT":
@@ -428,7 +551,7 @@ def parse_moomoo_csv(file_obj):
 # ============================================================
 
 def parse_trades(file_obj, usd_to_sgd=None, hkd_to_sgd=None):
-    meta, _, _, trades_df = _parse_statement(file_obj)
+    meta, _, _, trades_df, _ = _parse_statement(file_obj)
 
     if trades_df is None or trades_df.empty:
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
@@ -456,7 +579,7 @@ def parse_trades(file_obj, usd_to_sgd=None, hkd_to_sgd=None):
 
 
 # ============================================================
-# SAVE TRADES HISTORY (append + dedupe + FIFO recompute)
+# SAVE TRADES HISTORY
 # ============================================================
 
 def save_trades_history(file_obj, usd_to_sgd=None, hkd_to_sgd=None):
@@ -500,7 +623,6 @@ def save_trades_history(file_obj, usd_to_sgd=None, hkd_to_sgd=None):
             combined[col] = combined[col].combine_first(combined[old_col])
             combined.drop(columns=[old_col], inplace=True, errors="ignore")
 
-    # Re-run FIFO on Moomoo trades only
     combined = _recompute_fifo_for_platform(combined, "Moomoo")
 
     if "TradeDate" in combined.columns:
@@ -539,7 +661,7 @@ def load_trades_history():
 
 
 # ============================================================
-# FIFO RECOMPUTE (per platform, full history)
+# FIFO RECOMPUTE
 # ============================================================
 
 def _recompute_fifo_for_platform(all_trades_df, platform):
@@ -575,7 +697,7 @@ def _recompute_fifo_for_platform(all_trades_df, platform):
         sym_idx_set = set(sub.index[sub["Symbol"] == symbol].tolist())
         sym_idx = [i for i in sub_index_order if i in sym_idx_set]
 
-        open_queue = []  # list of [side, qty_remaining, price]
+        open_queue = []
 
         for idx in sym_idx:
             row = sub.loc[idx]
@@ -635,6 +757,53 @@ def _recompute_fifo_for_platform(all_trades_df, platform):
 
 
 # ============================================================
+# ⭐ CUMULATIVE RECOMPUTE
+# ============================================================
+
+def _recompute_cumulative(history_df, platform):
+    """Recompute Total* from cumsum of Period* (chronological order)."""
+    if history_df is None or history_df.empty:
+        return history_df
+    if "Platform" not in history_df.columns:
+        return history_df
+
+    df = history_df.copy()
+
+    mask = df["Platform"].astype(str) == platform
+    if not mask.any():
+        return df
+
+    sub = df[mask].copy()
+
+    def _extract_end_date(snap):
+        s = str(snap)
+        m = re.search(r"\(\d{8}-(\d{8})\)", s)
+        if m:
+            return m.group(1)
+        return "00000000"
+
+    sub["_sort_key"] = sub["SnapshotFile"].apply(_extract_end_date)
+    sub = sub.sort_values("_sort_key")
+
+    for total_col, period_col in [
+        ("TotalDeposit", "PeriodDeposit"),
+        ("TotalWithdrawal", "PeriodWithdrawal"),
+        ("TotalOther", "PeriodOther"),
+    ]:
+        if period_col in sub.columns:
+            period_vals = pd.to_numeric(sub[period_col], errors="coerce").fillna(0)
+            sub[total_col] = period_vals.cumsum()
+
+    sub = sub.drop(columns=["_sort_key"], errors="ignore")
+
+    for col in ["TotalDeposit", "TotalWithdrawal", "TotalOther"]:
+        if col in sub.columns:
+            df.loc[sub.index, col] = sub[col]
+
+    return df
+
+
+# ============================================================
 # SAVE SNAPSHOT + HISTORY
 # ============================================================
 
@@ -644,9 +813,11 @@ def save_snapshot_and_history(uploaded_file, *_args):
     name_part, ext_part = os.path.splitext(original_name)
 
     uploaded_file.seek(0)
-    meta, account_df, holdings_df, trades_df = _parse_statement(uploaded_file)
+    meta, account_df, holdings_df, trades_df, cash_flow_raw_df = _parse_statement(uploaded_file)
 
     usd_to_sgd, hkd_to_sgd = _get_meta_fx(meta)
+
+    cs = compute_cash_summary_from_raw(cash_flow_raw_df, usd_to_sgd, hkd_to_sgd)
 
     first_date, last_date = extract_report_date_range(meta)
 
@@ -673,7 +844,16 @@ def save_snapshot_and_history(uploaded_file, *_args):
 
     nav, cash = extract_nav_cash(account_df, usd_to_sgd, hkd_to_sgd, holdings_df=holdings_df)
     pnl = extract_total_pnl(holdings_df)
-    deposit = extract_period_deposit(meta)
+
+    # ⭐ Freshness check
+    if not _is_statement_fresh(meta):
+        nav = 0
+        cash = 0
+        pnl = 0
+
+    deposit = cs["deposits"]
+    withdrawal = cs["withdrawals"]
+    other = cs["other"]
 
     if os.path.exists(HISTORY_FILE):
         try:
@@ -683,14 +863,6 @@ def save_snapshot_and_history(uploaded_file, *_args):
     else:
         history_df = pd.DataFrame()
 
-    previous_total_deposit = 0
-    if not history_df.empty and "Platform" in history_df.columns:
-        moo_only = history_df[history_df["Platform"] == "Moomoo"]
-        if len(moo_only) > 0 and "TotalDeposit" in moo_only.columns:
-            previous_total_deposit = _safe_float(moo_only.iloc[-1]["TotalDeposit"], 0)
-
-    cumulative_deposit = previous_total_deposit + deposit
-
     new_row = pd.DataFrame([{
         "Platform": "Moomoo",
         "Timestamp": timestamp,
@@ -698,12 +870,16 @@ def save_snapshot_and_history(uploaded_file, *_args):
         "NAV": nav,
         "Cash": cash,
         "PnL": pnl,
-        "TotalDeposit": cumulative_deposit,
+        "TotalDeposit": 0,
         "PeriodDeposit": deposit,
-        "Dividends": 0,
-        "WithholdingTax": 0,
-        "NetDividends": 0,
-        "Fees": 0,
+        "TotalWithdrawal": 0,
+        "PeriodWithdrawal": withdrawal,
+        "TotalOther": 0,
+        "PeriodOther": other,
+        "Dividends": cs["dividends"],
+        "WithholdingTax": cs["withholding_tax"],
+        "NetDividends": cs["net_dividends"],
+        "Fees": cs["fees"],
         "UsdToSgd": usd_to_sgd,
     }])
 
@@ -714,12 +890,56 @@ def save_snapshot_and_history(uploaded_file, *_args):
             subset=["Platform", "SnapshotFile"], keep="last"
         )
 
+    history_df = _recompute_cumulative(history_df, "Moomoo")
+
     history_df.to_csv(HISTORY_FILE, index=False)
 
     uploaded_file.seek(0)
     save_trades_history(uploaded_file, usd_to_sgd=usd_to_sgd, hkd_to_sgd=hkd_to_sgd)
 
     return history_df
+
+
+# ============================================================
+# ⭐ COMPUTE CUMULATIVE OTHERS BREAKDOWN (across all snapshots)
+# ============================================================
+
+def compute_cumulative_others_breakdown():
+    """
+    Loop through all Moomoo snapshot files and compute cumulative
+    Stock Yield Income + Misc Other across ALL statements.
+
+    Each statement's Cash Flow Raw is re-classified using its own
+    UsdToSgd / HkdToSgd from meta (more accurate than global).
+    """
+    result = {
+        "stock_yield_income": 0.0,
+        "misc_other": 0.0,
+    }
+
+    if not os.path.exists(MOOMOO_SNAPSHOT_DIR):
+        return result
+
+    snapshot_files = [
+        f for f in os.listdir(MOOMOO_SNAPSHOT_DIR)
+        if f.lower().endswith(".csv")
+    ]
+
+    for f in snapshot_files:
+        snapshot_path = os.path.join(MOOMOO_SNAPSHOT_DIR, f)
+        try:
+            with open(snapshot_path, "rb") as fh:
+                fake_upload = io.BytesIO(fh.read())
+                meta, _, _, _, cash_flow_raw_df = _parse_statement(fake_upload)
+                stmt_usd, stmt_hkd = _get_meta_fx(meta)
+
+                cs = compute_cash_summary_from_raw(cash_flow_raw_df, stmt_usd, stmt_hkd)
+                result["stock_yield_income"] += cs["stock_yield_income"]
+                result["misc_other"] += cs["misc_other"]
+        except:
+            continue
+
+    return result
 
 
 # ============================================================
@@ -746,6 +966,18 @@ def load_latest_snapshot():
     if moo_df.empty:
         return None
 
+    def _extract_end_date(snap):
+        s = str(snap)
+        m = re.search(r"\(\d{8}-(\d{8})\)", s)
+        if m:
+            return m.group(1)
+        return "00000000"
+
+    moo_df = moo_df.copy()
+    moo_df["_sort_key"] = moo_df["SnapshotFile"].apply(_extract_end_date)
+    moo_df = moo_df.sort_values("_sort_key")
+    moo_df = moo_df.drop(columns=["_sort_key"])
+
     latest = moo_df.iloc[-1]
     snapshot_file = latest["SnapshotFile"]
 
@@ -761,11 +993,14 @@ def load_latest_snapshot():
         fake_upload = io.BytesIO(f.read())
         fake_upload.name = snapshot_file
 
-        meta, account_df, holdings_df, _ = _parse_statement(fake_upload)
+        meta, account_df, holdings_df, _, _ = _parse_statement(fake_upload)
         usd_to_sgd, hkd_to_sgd = _get_meta_fx(meta)
 
         fake_upload.seek(0)
         df_positions = parse_moomoo_csv(fake_upload)
+
+    # ⭐ Stock Yield + Misc Other are CUMULATIVE across all statements
+    others = compute_cumulative_others_breakdown()
 
     return {
         "df_positions": df_positions,
@@ -773,7 +1008,11 @@ def load_latest_snapshot():
         "nav": _safe_float(latest["NAV"], 0),
         "cash": _safe_float(latest["Cash"], 0),
         "pnl": _safe_float(latest["PnL"], 0),
-        "deposit": _safe_float(latest["TotalDeposit"], 0),
+        "deposit": _safe_float(latest.get("TotalDeposit", 0), 0),
+        "withdrawal": _safe_float(latest.get("TotalWithdrawal", 0), 0),
+        "other": _safe_float(latest.get("TotalOther", 0), 0),
+        "stock_yield_income": others["stock_yield_income"],
+        "misc_other": others["misc_other"],
         "usd_to_sgd": usd_to_sgd,
         "hkd_to_sgd": hkd_to_sgd,
         "platform": "Moomoo",
@@ -816,13 +1055,24 @@ def process_incoming():
                 continue
 
             fake_upload.seek(0)
-            meta, account_df, holdings_df, trades_df = _parse_statement(fake_upload)
+            meta, account_df, holdings_df, trades_df, cash_flow_raw_df = _parse_statement(fake_upload)
             usd_to_sgd, hkd_to_sgd = _get_meta_fx(meta)
+
+            cs = compute_cash_summary_from_raw(cash_flow_raw_df, usd_to_sgd, hkd_to_sgd)
 
             first_date, last_date = extract_report_date_range(meta)
             nav, cash = extract_nav_cash(account_df, usd_to_sgd, hkd_to_sgd, holdings_df=holdings_df)
             pnl = extract_total_pnl(holdings_df)
-            deposit = extract_period_deposit(meta)
+
+            # ⭐ Freshness check
+            if not _is_statement_fresh(meta):
+                nav = 0
+                cash = 0
+                pnl = 0
+
+            deposit = cs["deposits"]
+            withdrawal = cs["withdrawals"]
+            other = cs["other"]
 
             fake_upload.seek(0)
             save_trades_history(fake_upload, usd_to_sgd=usd_to_sgd, hkd_to_sgd=hkd_to_sgd)
@@ -843,12 +1093,6 @@ def process_incoming():
             new_name = f
             timestamp = f.replace("moomoo_statement_", "").replace(".csv", "")
 
-        previous_deposit = 0
-        if not history_df.empty and "Platform" in history_df.columns:
-            moo_only = history_df[history_df["Platform"] == "Moomoo"]
-            if len(moo_only) > 0 and "TotalDeposit" in moo_only.columns:
-                previous_deposit = _safe_float(moo_only.iloc[-1]["TotalDeposit"], 0)
-
         new_row = pd.DataFrame([{
             "Platform": "Moomoo",
             "Timestamp": timestamp,
@@ -856,12 +1100,16 @@ def process_incoming():
             "NAV": nav,
             "Cash": cash,
             "PnL": pnl,
-            "TotalDeposit": previous_deposit + deposit,
+            "TotalDeposit": 0,
             "PeriodDeposit": deposit,
-            "Dividends": 0,
-            "WithholdingTax": 0,
-            "NetDividends": 0,
-            "Fees": 0,
+            "TotalWithdrawal": 0,
+            "PeriodWithdrawal": withdrawal,
+            "TotalOther": 0,
+            "PeriodOther": other,
+            "Dividends": cs["dividends"],
+            "WithholdingTax": cs["withholding_tax"],
+            "NetDividends": cs["net_dividends"],
+            "Fees": cs["fees"],
             "UsdToSgd": usd_to_sgd,
         }])
 
@@ -875,156 +1123,13 @@ def process_incoming():
             subset=["Platform", "SnapshotFile"], keep="last"
         )
 
+    history_df = _recompute_cumulative(history_df, "Moomoo")
+
     history_df.to_csv(HISTORY_FILE, index=False)
 
 
 # ============================================================
-# COVERAGE / GAP DETECTION
-# (Reads from portfolio_history.csv SnapshotFile names)
-# ============================================================
-
-def _extract_dates_from_filename(snapshot_file):
-    """
-    Extract (start_dt, end_dt) from filenames like:
-      moomoo_statement(20250627-20260627).csv
-      ibkr_statement(20250101-20251231).csv
-      tiger_statement(20250101-20251231).csv
-    """
-    s = str(snapshot_file)
-    m = re.search(r"\((\d{8})\s*-\s*(\d{8})\)", s)
-    if not m:
-        return None, None
-
-    try:
-        sd = datetime.strptime(m.group(1), "%Y%m%d")
-        ed = datetime.strptime(m.group(2), "%Y%m%d")
-        return sd, ed
-    except:
-        return None, None
-
-
-def detect_coverage_gaps(platform="Moomoo"):
-    """
-    Detect gaps in statement coverage by reading SnapshotFile names
-    from portfolio_history.csv.
-
-    Returns:
-      {
-        "ranges":   [(start, end), ...],
-        "gaps":     [(gap_start, gap_end), ...],
-        "overlaps": [(a, b), ...],
-        "total_days":   int,
-        "covered_days": int,
-      }
-    """
-    result = {
-        "ranges": [],
-        "gaps": [],
-        "overlaps": [],
-        "total_days": 0,
-        "covered_days": 0,
-    }
-
-    if not os.path.exists(HISTORY_FILE):
-        return result
-
-    try:
-        df = pd.read_csv(HISTORY_FILE)
-    except:
-        return result
-
-    if df.empty or "Platform" not in df.columns or "SnapshotFile" not in df.columns:
-        return result
-
-    df = df[df["Platform"] == platform]
-    if df.empty:
-        return result
-
-    ranges = []
-    for _, row in df.iterrows():
-        sd, ed = _extract_dates_from_filename(row["SnapshotFile"])
-        if sd is not None and ed is not None:
-            ranges.append((sd, ed))
-
-    if not ranges:
-        return result
-
-    ranges.sort(key=lambda x: x[0])
-    result["ranges"] = [(s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d")) for s, e in ranges]
-
-    # Overlaps
-    for i in range(1, len(ranges)):
-        prev_s, prev_e = ranges[i - 1]
-        cur_s, cur_e = ranges[i]
-        if cur_s <= prev_e:
-            result["overlaps"].append(
-                (cur_s.strftime("%Y-%m-%d"), min(prev_e, cur_e).strftime("%Y-%m-%d"))
-            )
-
-    # Merge ranges
-    merged = []
-    for s, e in ranges:
-        if not merged:
-            merged.append([s, e])
-        else:
-            last_s, last_e = merged[-1]
-            if s <= last_e + timedelta(days=1):
-                merged[-1][1] = max(last_e, e)
-            else:
-                merged.append([s, e])
-
-    # Gaps between merged ranges
-    for i in range(1, len(merged)):
-        gap_start = merged[i - 1][1] + timedelta(days=1)
-        gap_end = merged[i][0] - timedelta(days=1)
-        if gap_start <= gap_end:
-            result["gaps"].append(
-                (gap_start.strftime("%Y-%m-%d"), gap_end.strftime("%Y-%m-%d"))
-            )
-
-    overall_start = merged[0][0]
-    overall_end = merged[-1][1]
-    total_days = (overall_end - overall_start).days + 1
-
-    covered_days = 0
-    for s, e in merged:
-        covered_days += (e - s).days + 1
-
-    result["total_days"] = total_days
-    result["covered_days"] = covered_days
-
-    return result
-
-
-def get_coverage_summary(platform="Moomoo"):
-    """Human-readable summary for dashboard display."""
-    info = detect_coverage_gaps(platform)
-    lines = []
-
-    if not info["ranges"]:
-        return f"⚠️ 没有 {platform} statement coverage 记录。"
-
-    lines.append(f"📅 {platform} 已上传 {len(info['ranges'])} 份 statement")
-    lines.append(f"   覆盖 {info['covered_days']} / {info['total_days']} 天")
-
-    if info["gaps"]:
-        lines.append(f"\n⚠️ 检测到 {len(info['gaps'])} 个日期缺口：")
-        for gs, ge in info["gaps"]:
-            lines.append(f"   • {gs} → {ge}")
-        lines.append("\n👉 建议补一份覆盖这段时间的 statement，否则 FIFO 可能不准。")
-    else:
-        lines.append("✅ 没有日期缺口，FIFO 计算可信。")
-
-    if info["overlaps"]:
-        lines.append(f"\nℹ️ 有 {len(info['overlaps'])} 个重叠区间（不影响，已去重）：")
-        for os_, oe in info["overlaps"][:5]:
-            lines.append(f"   • {os_} → {oe}")
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# ANALYZE POSITIONS (uses PositionValueSgd directly)
+# ANALYZE POSITIONS
 # ============================================================
 
 def analyze_positions(df_positions, total_nav_sgd, cash_sgd):
@@ -1155,7 +1260,7 @@ def analyze_positions(df_positions, total_nav_sgd, cash_sgd):
 
 
 # ============================================================
-# CASH SUMMARY (Moomoo statement doesn't expose dividends/fees directly)
+# CASH SUMMARY TOTAL
 # ============================================================
 
 def load_cash_summary_total():
@@ -1163,30 +1268,34 @@ def load_cash_summary_total():
 
 
 def load_cash_summary_total_sgd():
+    default = {
+        "dividends": 0, "withholding_tax": 0, "net_dividends": 0,
+        "fees": 0, "deposits": 0, "withdrawals": 0, "other": 0,
+    }
+
     if not os.path.exists(HISTORY_FILE):
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
     try:
         df = pd.read_csv(HISTORY_FILE)
     except:
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
     if df.empty or "Platform" not in df.columns:
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
     df = df[df["Platform"] == "Moomoo"]
     if df.empty:
-        return {"dividends": 0, "withholding_tax": 0, "net_dividends": 0, "fees": 0, "deposits": 0}
+        return default
 
-    for col in ["Dividends", "WithholdingTax", "NetDividends", "Fees", "PeriodDeposit"]:
+    for col in ["Dividends", "WithholdingTax", "NetDividends", "Fees",
+                "PeriodDeposit", "PeriodWithdrawal", "PeriodOther"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    total_deposit = 0
-    if "TotalDeposit" in df.columns:
-        td = pd.to_numeric(df["TotalDeposit"], errors="coerce").fillna(0)
-        if len(td) > 0:
-            total_deposit = float(td.iloc[-1])
+    total_deposit = float(df["PeriodDeposit"].sum()) if "PeriodDeposit" in df.columns else 0
+    total_withdrawal = float(df["PeriodWithdrawal"].sum()) if "PeriodWithdrawal" in df.columns else 0
+    total_other = float(df["PeriodOther"].sum()) if "PeriodOther" in df.columns else 0
 
     return {
         "dividends": float(df["Dividends"].sum()) if "Dividends" in df.columns else 0,
@@ -1194,11 +1303,13 @@ def load_cash_summary_total_sgd():
         "net_dividends": float(df["NetDividends"].sum()) if "NetDividends" in df.columns else 0,
         "fees": float(df["Fees"].sum()) if "Fees" in df.columns else 0,
         "deposits": total_deposit,
+        "withdrawals": total_withdrawal,
+        "other": total_other,
     }
 
 
 # ============================================================
-# REALIZED PNL SUMMARY (SGD)
+# REALIZED PNL SUMMARY
 # ============================================================
 
 def load_realized_pnl_summary():

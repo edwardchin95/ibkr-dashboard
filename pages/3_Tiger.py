@@ -71,6 +71,8 @@ total_nav = 0
 cash = 0
 real_pnl = 0
 total_deposit = 0
+total_withdrawal = 0
+total_other = 0
 usd_to_sgd_current = 1.34
 
 loaded = tiger_cached_load_latest_snapshot(history_mtime)
@@ -80,11 +82,15 @@ if loaded is not None:
     df_positions = loaded["df_positions"]
     usd_to_sgd_current = loaded.get("usd_to_sgd", 1.34)
 
-    # History 现在已经是 SGD
     total_nav = float(loaded["nav"])
     cash = float(loaded["cash"])
     real_pnl = float(loaded["pnl"])
     total_deposit = float(loaded["deposit"])
+    total_withdrawal = float(loaded.get("withdrawal", 0))
+    total_other = float(loaded.get("other", 0))
+
+# ⭐ Net Capital = Deposit + Withdrawal (withdrawal is negative)
+net_capital = total_deposit + total_withdrawal
 
 # Realized P&L SGD
 realized_summary_sgd = tiger_cached_load_realized_pnl_summary_sgd(trades_mtime)
@@ -179,10 +185,11 @@ if coverage_info["ranges"]:
 # Tiger Summary Card
 # ============================================================
 cash_pct = (cash / total_nav * 100) if total_nav != 0 else 0
-portfolio_return = total_nav - total_deposit
-return_pct = (portfolio_return / total_deposit * 100) if total_deposit != 0 else 0
+portfolio_return = total_nav - net_capital
+return_pct = (portfolio_return / net_capital * 100) if net_capital != 0 else 0
 return_color = "#66FF99" if portfolio_return >= 0 else "#FF6666"
 pnl_color = "#66FF99" if real_pnl >= 0 else "#FF6666"
+nc_color = "#66FF99" if net_capital >= 0 else "#FF6666"
 
 st.markdown(f"""
 <div class='card' style='padding:24px;'>
@@ -214,9 +221,9 @@ SGD ${real_pnl:,.2f}
 </div>
 
 <div>
-<div style='color:gray; font-size:13px;'>Total Deposits</div>
-<div style='color:white; font-size:24px; font-weight:bold;'>
-SGD ${total_deposit:,.2f}
+<div style='color:gray; font-size:13px;'>Net Capital</div>
+<div style='color:{nc_color}; font-size:24px; font-weight:bold;'>
+SGD ${net_capital:,.2f}
 </div>
 </div>
 
@@ -614,12 +621,10 @@ if df_positions is not None and not df_positions.empty:
             cols_3dp=["UsdToSgd"],
         )
 
-        # 确保 journal columns 存在
         for col in ["Strategy", "Notes"]:
             if col not in editable_df.columns:
                 editable_df[col] = ""
 
-        # 避免 None/nan 显示和保存出问题
         for col in ["Strategy", "Notes"]:
             editable_df[col] = (
                 editable_df[col]
@@ -629,7 +634,6 @@ if df_positions is not None and not df_positions.empty:
                 .replace("None", "")
             )
 
-        # 只允许编辑 Strategy / Notes
         edited_df = st.data_editor(
             editable_df,
             use_container_width=True,
@@ -648,13 +652,11 @@ if df_positions is not None and not df_positions.empty:
                 if not os.path.exists(TRADES_HISTORY_FILE):
                     st.warning("trades_history.csv not found")
                 else:
-                    # ✅ 关键：读取完整 unified trades_history.csv，不是当前 page 的 filtered dataframe
                     full_df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
 
                     if full_df.empty:
                         st.warning("No trades to save")
                     else:
-                        # 确保 columns 存在
                         for col in ["Strategy", "Notes"]:
                             if col not in full_df.columns:
                                 full_df[col] = ""
@@ -663,7 +665,6 @@ if df_positions is not None and not df_positions.empty:
                             if col not in edited_df.columns:
                                 edited_df[col] = ""
 
-                        # ✅ 必须包含 Platform，避免 Tiger save 误伤 IBKR / Moomoo
                         key_cols = [
                             "Platform",
                             "TradeDate",
@@ -674,7 +675,6 @@ if df_positions is not None and not df_positions.empty:
                             "NetCash",
                         ]
 
-                        # 确保 key columns 存在
                         for col in key_cols:
                             if col not in full_df.columns:
                                 full_df[col] = ""
@@ -695,7 +695,6 @@ if df_positions is not None and not df_positions.empty:
                         full_df["_TradeKey"] = make_key(full_df)
                         edited_df["_TradeKey"] = make_key(edited_df)
 
-                        # 只取 edited rows 的 Strategy / Notes
                         updates = edited_df[["_TradeKey", "Strategy", "Notes"]].copy()
 
                         for col in ["Strategy", "Notes"]:
@@ -712,7 +711,6 @@ if df_positions is not None and not df_positions.empty:
                         strategy_map = updates.set_index("_TradeKey")["Strategy"].to_dict()
                         notes_map = updates.set_index("_TradeKey")["Notes"].to_dict()
 
-                        # ✅ 只更新匹配到的 rows，其他平台/其他交易完全保留
                         full_df["Strategy"] = full_df.apply(
                             lambda r: strategy_map[r["_TradeKey"]]
                             if r["_TradeKey"] in strategy_map
@@ -743,7 +741,6 @@ if df_positions is not None and not df_positions.empty:
         # 📈 Trading Performance（用 RealizedPnLSgd）
         # ============================================================
 
-        # Prefer SGD column
         pnl_col = None
         if "RealizedPnLSgd" in filtered.columns:
             pnl_col = "RealizedPnLSgd"
@@ -877,51 +874,94 @@ if df_positions is not None and not df_positions.empty:
         st.info("暂无交易记录。上传 Tiger CSV 后会自动累加。")
 
     # ============================================================
-    # 💰 Dividends & Deposits 累计（SGD）
+    # 💰 Dividends & Capital (3 + 4 布局)
     # ============================================================
     st.markdown(
-        "<div class='section-title'>💰 Dividends & Deposits</div>",
+        "<div class='section-title'>💰 Dividends & Capital</div>",
         unsafe_allow_html=True
     )
 
+    cs_dividends = cash_summary_sgd.get("dividends", 0) if cash_summary_sgd else 0
+    cs_wht = cash_summary_sgd.get("withholding_tax", 0) if cash_summary_sgd else 0
+    cs_netdiv = cash_summary_sgd.get("net_dividends", 0) if cash_summary_sgd else 0
+    cs_deposits = cash_summary_sgd.get("deposits", 0) if cash_summary_sgd else total_deposit
+    cs_withdraw = cash_summary_sgd.get("withdrawals", 0) if cash_summary_sgd else total_withdrawal
+    cs_other = cash_summary_sgd.get("other", 0) if cash_summary_sgd else total_other
+
+    cs_netcapital = cs_deposits + cs_withdraw  # withdrawal 是负数
+
     if cash_summary_sgd and (
-        cash_summary_sgd["dividends"] != 0
-        or cash_summary_sgd["withholding_tax"] != 0
-        or cash_summary_sgd["deposits"] != 0
+        cs_dividends != 0 or cs_wht != 0 or cs_deposits != 0
+        or cs_withdraw != 0 or cs_other != 0
     ):
+
+        netcap_color = "#66FF99" if cs_netcapital >= 0 else "#FF6666"
+        other_color = "#66FF99" if cs_other >= 0 else "#FF6666"
 
         st.markdown(f"""
         <div class='card' style='padding:24px;'>
 
+        <!-- 第一行: Dividends 组 (3 张卡) -->
         <div style='display:grid;
                     grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));
-                    gap:20px;'>
+                    gap:20px;
+                    margin-bottom:16px;'>
 
         <div>
         <div style='color:gray; font-size:13px;'>Total Dividends</div>
         <div style='color:#66FF99; font-size:22px; font-weight:bold;'>
-        SGD ${cash_summary_sgd['dividends']:,.2f}
+        SGD ${cs_dividends:,.2f}
         </div>
         </div>
 
         <div>
         <div style='color:gray; font-size:13px;'>Withholding Tax</div>
         <div style='color:#FF6666; font-size:22px; font-weight:bold;'>
-        SGD ${cash_summary_sgd['withholding_tax']:,.2f}
+        SGD ${cs_wht:,.2f}
         </div>
         </div>
 
         <div>
         <div style='color:gray; font-size:13px;'>Net Dividends</div>
         <div style='color:#66FF99; font-size:22px; font-weight:bold;'>
-        SGD ${cash_summary_sgd['net_dividends']:,.2f}
+        SGD ${cs_netdiv:,.2f}
+        </div>
+        </div>
+
+        </div>
+
+        <!-- 第二行: Capital + Net Others (4 张卡) -->
+        <div style='border-top:1px solid #333;
+                    padding-top:16px;
+                    display:grid;
+                    grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));
+                    gap:20px;'>
+
+        <div>
+        <div style='color:gray; font-size:13px;'>Total Deposit</div>
+        <div style='color:#66FF99; font-size:22px; font-weight:bold;'>
+        SGD ${cs_deposits:,.2f}
         </div>
         </div>
 
         <div>
-        <div style='color:gray; font-size:13px;'>Total Deposits</div>
-        <div style='color:white; font-size:22px; font-weight:bold;'>
-        SGD ${cash_summary_sgd['deposits']:,.2f}
+        <div style='color:gray; font-size:13px;'>Total Withdrawals</div>
+        <div style='color:#FF6666; font-size:22px; font-weight:bold;'>
+        SGD ${cs_withdraw:,.2f}
+        </div>
+        </div>
+
+        <div>
+        <div style='color:gray; font-size:13px;'>Net Capital</div>
+        <div style='color:{netcap_color}; font-size:22px; font-weight:bold;'>
+        SGD ${cs_netcapital:,.2f}
+        </div>
+        </div>
+
+        <div>
+        <div style='color:gray; font-size:13px;'>Net Others</div>
+        <div style='color:{other_color}; font-size:22px; font-weight:bold;'>
+        SGD ${cs_other:,.2f}
         </div>
         </div>
 
