@@ -394,18 +394,25 @@ def parse_ibkr_csv(file_obj):
 # ============================================================
 # ⭐ CUMULATIVE RECOMPUTE (cumsum-based, avoid re-upload bug)
 # ============================================================
-
 def _recompute_cumulative(history_df, platform):
-    """
-    Recompute Total* fields from cumsum of Period* values (chronological order).
-    Robust to re-uploads.
-    """
+    """Recompute Total* from cumsum of Period* (chronological order)."""
     if history_df is None or history_df.empty:
         return history_df
     if "Platform" not in history_df.columns:
         return history_df
 
     df = history_df.copy()
+
+    # ⭐ Force all amount columns to float (handle old csv where they might be int)
+    amount_cols = [
+        "TotalDeposit", "PeriodDeposit",
+        "TotalWithdrawal", "PeriodWithdrawal",
+        "TotalOther", "PeriodOther",
+    ]
+    for col in amount_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
 
     mask = df["Platform"].astype(str) == platform
     if not mask.any():
@@ -436,11 +443,9 @@ def _recompute_cumulative(history_df, platform):
 
     for col in ["TotalDeposit", "TotalWithdrawal", "TotalOther"]:
         if col in sub.columns:
-            df.loc[sub.index, col] = sub[col]
+            df.loc[sub.index, col] = sub[col].astype(float)
 
     return df
-
-
 # ============================================================
 # SAVE SNAPSHOT + HISTORY
 # ============================================================

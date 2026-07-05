@@ -3,4 +3,5 @@ __pycache__/
 data/
 .env
 .gitignore
+moomoo_api.py
 README.md

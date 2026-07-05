@@ -796,9 +796,15 @@ def _recompute_cumulative(history_df, platform):
 
     sub = sub.drop(columns=["_sort_key"], errors="ignore")
 
+    # ⭐ Ensure columns are float dtype (avoid int64 conflict with old csv)
+    for col in ["TotalDeposit", "TotalWithdrawal", "TotalOther"]:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+
     for col in ["TotalDeposit", "TotalWithdrawal", "TotalOther"]:
         if col in sub.columns:
-            df.loc[sub.index, col] = sub[col]
+            df.loc[sub.index, col] = sub[col].astype(float)
 
     return df
 

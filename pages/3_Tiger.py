@@ -608,26 +608,22 @@ if df_positions is not None and not df_positions.empty:
             filtered = filtered[filtered["Buy/Sell"] == sel_side]
 
         # ================================
-        # ✅ Editable Trade Journal
+        # ✅ Editable Trade Journal（单一表）
         # ================================
 
-        editable_df = filtered.copy()
+        editor_key = "tiger_trade_journal_editor"
 
-        # ⭐ 显示用：2位小数 / 汇率3位小数
-        editable_df = format_df(
-            editable_df,
-            cols_2dp=["Quantity", "TradePrice", "NetCash", "Commission",
-                    "RealizedPnL", "RealizedPnLSgd"],
-            cols_3dp=["UsdToSgd"],
-        )
+        editor_df = filtered.copy()
 
+        # ✅ 确保 journal columns
         for col in ["Strategy", "Notes"]:
-            if col not in editable_df.columns:
-                editable_df[col] = ""
+            if col not in editor_df.columns:
+                editor_df[col] = ""
 
+        # ✅ 清洗
         for col in ["Strategy", "Notes"]:
-            editable_df[col] = (
-                editable_df[col]
+            editor_df[col] = (
+                editor_df[col]
                 .fillna("")
                 .astype(str)
                 .replace("nan", "")
@@ -635,17 +631,59 @@ if df_positions is not None and not df_positions.empty:
             )
 
         edited_df = st.data_editor(
-            editable_df,
+            editor_df,
             use_container_width=True,
             hide_index=True,
-            disabled=[c for c in editable_df.columns if c not in ["Strategy", "Notes"]],
-            key="tiger_trade_journal_editor"
+            disabled=[c for c in editor_df.columns if c not in ["Strategy", "Notes"]],
+            key=editor_key,
+
+            # ✅ ✅ ✅ 数字格式（不用 format_df）
+            column_config={
+                "Quantity": st.column_config.NumberColumn(format="%.2f"),
+                "TradePrice": st.column_config.NumberColumn(format="%.2f"),
+                "NetCash": st.column_config.NumberColumn(format="%.2f"),
+                "Commission": st.column_config.NumberColumn(format="%.2f"),
+                "RealizedPnL": st.column_config.NumberColumn(format="%.2f"),
+                "RealizedPnLSgd": st.column_config.NumberColumn(format="%.2f"),
+                "UsdToSgd": st.column_config.NumberColumn(format="%.3f"),
+
+                # ✅ 不设 width → 才接近 autofit
+                "Strategy": st.column_config.TextColumn("Strategy"),
+                "Notes": st.column_config.TextColumn("Notes"),
+            }
         )
+
+        # ✅ ✅ ✅ Autofit + Notes 自动换行（核心）
+        st.markdown("""
+        <style>
+
+        /* ✅ 表格自动撑满 */
+        div[data-testid="stDataEditor"] table {
+            width: 100% !important;
+        }
+
+        /* ✅ column 自动适应 */
+        div[data-testid="stDataEditor"] th,
+        div[data-testid="stDataEditor"] td {
+            white-space: normal !important;
+            max-width: none !important;
+        }
+
+        /* ✅ Notes 自动换行 + 高度 */
+        div[data-testid="stDataEditor"] textarea {
+            white-space: pre-wrap !important;
+            overflow-wrap: break-word !important;
+            word-break: break-word !important;
+            min-height: 80px !important;
+            line-height: 1.5;
+        }
+
+        </style>
+        """, unsafe_allow_html=True)
 
         # ================================
         # ✅ Save Button
         # ================================
-
         if st.button("💾 Save Trade Journal", use_container_width=True):
 
             try:
@@ -657,13 +695,43 @@ if df_positions is not None and not df_positions.empty:
                     if full_df.empty:
                         st.warning("No trades to save")
                     else:
-                        for col in ["Strategy", "Notes"]:
-                            if col not in full_df.columns:
-                                full_df[col] = ""
 
+                        # ⭐ mobile fix
+                        state = st.session_state.get(editor_key, None)
+
+                        if isinstance(state, dict) and "edited_rows" in state:
+                            edited_df = edited_df.copy()
+
+                            for row_pos, changes in state.get("edited_rows", {}).items():
+                                try:
+                                    row_pos = int(row_pos)
+                                except:
+                                    continue
+
+                                for col, value in changes.items():
+                                    if col in edited_df.columns and row_pos < len(edited_df):
+                                        edited_df.iloc[
+                                            row_pos,
+                                            edited_df.columns.get_loc(col)
+                                        ] = value
+
+                        # ✅ 清洗
                         for col in ["Strategy", "Notes"]:
                             if col not in edited_df.columns:
                                 edited_df[col] = ""
+
+                            edited_df[col] = (
+                                edited_df[col]
+                                .fillna("")
+                                .astype(str)
+                                .replace("nan", "")
+                                .replace("None", "")
+                            )
+
+                        # ✅ full_df columns
+                        for col in ["Strategy", "Notes"]:
+                            if col not in full_df.columns:
+                                full_df[col] = ""
 
                         key_cols = [
                             "Platform",
@@ -696,34 +764,20 @@ if df_positions is not None and not df_positions.empty:
                         edited_df["_TradeKey"] = make_key(edited_df)
 
                         updates = edited_df[["_TradeKey", "Strategy", "Notes"]].copy()
-
-                        for col in ["Strategy", "Notes"]:
-                            updates[col] = (
-                                updates[col]
-                                .fillna("")
-                                .astype(str)
-                                .replace("nan", "")
-                                .replace("None", "")
-                            )
-
                         updates = updates.drop_duplicates(subset=["_TradeKey"], keep="last")
 
-                        strategy_map = updates.set_index("_TradeKey")["Strategy"].to_dict()
-                        notes_map = updates.set_index("_TradeKey")["Notes"].to_dict()
-
-                        full_df["Strategy"] = full_df.apply(
-                            lambda r: strategy_map[r["_TradeKey"]]
-                            if r["_TradeKey"] in strategy_map
-                            else r.get("Strategy", ""),
-                            axis=1
+                        full_df = full_df.merge(
+                            updates,
+                            on="_TradeKey",
+                            how="left",
+                            suffixes=("", "_new")
                         )
 
-                        full_df["Notes"] = full_df.apply(
-                            lambda r: notes_map[r["_TradeKey"]]
-                            if r["_TradeKey"] in notes_map
-                            else r.get("Notes", ""),
-                            axis=1
-                        )
+                        for col in ["Strategy", "Notes"]:
+                            new_col = f"{col}_new"
+                            if new_col in full_df.columns:
+                                full_df[col] = full_df[new_col].combine_first(full_df[col])
+                                full_df.drop(columns=[new_col], inplace=True)
 
                         full_df = full_df.drop(columns=["_TradeKey"], errors="ignore")
 
@@ -736,7 +790,7 @@ if df_positions is not None and not df_positions.empty:
             except Exception as e:
                 st.error(f"Save failed: {e}")
 
-
+    
         # ============================================================
         # 📈 Trading Performance（用 RealizedPnLSgd）
         # ============================================================
