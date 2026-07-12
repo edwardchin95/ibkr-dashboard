@@ -646,11 +646,7 @@ if df_positions is not None and not df_positions.empty:
                 # ✅ 不设 fixed width → 接近 autofit
                 "Strategy": st.column_config.TextColumn("Strategy"),
                 "Notes": st.column_config.TextColumn("Notes"),
-                "Breakeven": st.column_config.NumberColumn(
-                    "Breakeven",
-                    format="%.2f",
-                    help="Adjusted breakeven after rolls / adjustments"
-                ),
+                "Breakeven": st.column_config.TextColumn("Breakeven")
             }
         )
 
