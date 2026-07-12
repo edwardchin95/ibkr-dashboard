@@ -604,11 +604,11 @@ if df_positions is not None and not df_positions.empty:
 
         editor_df = filtered.copy()
 
-        for col in ["Strategy", "Notes"]:
+        for col in ["Strategy", "Notes", "Breakeven"]:
             if col not in editor_df.columns:
                 editor_df[col] = ""
 
-        for col in ["Strategy", "Notes"]:
+        for col in ["Strategy", "Notes", "Breakeven"]:
             editor_df[col] = (
                 editor_df[col]
                 .fillna("")
@@ -621,7 +621,10 @@ if df_positions is not None and not df_positions.empty:
             editor_df,
             use_container_width=True,   # ✅ 关键 1：让表格占满
             hide_index=True,
-            disabled=[c for c in editor_df.columns if c not in ["Strategy", "Notes"]],
+            disabled=[
+                c for c in editor_df.columns
+                if c not in ["Strategy", "Notes", "Breakeven"]
+            ],
             key=editor_key,
 
             # ✅ ✅ ✅ 核心：不要写 width！
@@ -637,7 +640,12 @@ if df_positions is not None and not df_positions.empty:
 
                 # ✅ ❗ 不要 width=large
                 "Strategy": st.column_config.TextColumn("Strategy"),
-                "Notes": st.column_config.TextColumn("Notes")
+                "Notes": st.column_config.TextColumn("Notes"),
+                "Breakeven": st.column_config.NumberColumn(
+                    "Breakeven",
+                    format="%.2f",
+                    help="Adjusted breakeven after rolls / adjustments"
+                )
             }
         )
 
@@ -709,7 +717,7 @@ if df_positions is not None and not df_positions.empty:
                                         ] = value
 
                         # ✅ 清洗 journal columns
-                        for col in ["Strategy", "Notes"]:
+                        for col in ["Strategy", "Notes", "Breakeven"]:
                             if col not in edited_df.columns:
                                 edited_df[col] = ""
 
@@ -721,8 +729,8 @@ if df_positions is not None and not df_positions.empty:
                                 .replace("None", "")
                             )
 
-                        # ✅ 确保 full_df 也有 Strategy / Notes
-                        for col in ["Strategy", "Notes"]:
+                        # ✅ 确保 full_df 也有 Strategy / Notes / Breakeven
+                        for col in ["Strategy", "Notes", "Breakeven"]:
                             if col not in full_df.columns:
                                 full_df[col] = ""
 
@@ -759,7 +767,9 @@ if df_positions is not None and not df_positions.empty:
                         edited_df["_TradeKey"] = make_key(edited_df)
 
                         # ✅ 不再依赖 changed rows，直接 merge overwrite 当前显示 rows
-                        updates = edited_df[["_TradeKey", "Strategy", "Notes"]].copy()
+                        updates = edited_df[
+                            ["_TradeKey", "Strategy", "Notes", "Breakeven"]
+                        ].copy()
                         updates = updates.drop_duplicates(subset=["_TradeKey"], keep="last")
 
                         full_df = full_df.merge(
@@ -769,7 +779,7 @@ if df_positions is not None and not df_positions.empty:
                             suffixes=("", "_new")
                         )
 
-                        for col in ["Strategy", "Notes"]:
+                        for col in ["Strategy", "Notes", "Breakeven"]:
                             new_col = f"{col}_new"
                             if new_col in full_df.columns:
                                 full_df[col] = full_df[new_col].combine_first(full_df[col])
@@ -785,7 +795,6 @@ if df_positions is not None and not df_positions.empty:
 
             except Exception as e:
                 st.error(f"Save failed: {e}")
-
         # ============================================================
         # 📈 Trading Performance（用 RealizedPnLSgd）
         # ============================================================

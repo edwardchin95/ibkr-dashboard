@@ -616,12 +616,12 @@ if df_positions is not None and not df_positions.empty:
         editor_df = filtered.copy()
 
         # ✅ 确保 journal columns
-        for col in ["Strategy", "Notes"]:
+        for col in ["Strategy", "Notes", "Breakeven"]:
             if col not in editor_df.columns:
                 editor_df[col] = ""
 
         # ✅ 清洗
-        for col in ["Strategy", "Notes"]:
+        for col in ["Strategy", "Notes", "Breakeven"]:
             editor_df[col] = (
                 editor_df[col]
                 .fillna("")
@@ -634,7 +634,10 @@ if df_positions is not None and not df_positions.empty:
             editor_df,
             use_container_width=True,
             hide_index=True,
-            disabled=[c for c in editor_df.columns if c not in ["Strategy", "Notes"]],
+            disabled=[
+                c for c in editor_df.columns
+                if c not in ["Strategy", "Notes", "Breakeven"]
+            ],
             key=editor_key,
 
             # ✅ ✅ ✅ 数字格式（不用 format_df）
@@ -650,6 +653,11 @@ if df_positions is not None and not df_positions.empty:
                 # ✅ 不设 width → 才接近 autofit
                 "Strategy": st.column_config.TextColumn("Strategy"),
                 "Notes": st.column_config.TextColumn("Notes"),
+                "Breakeven": st.column_config.NumberColumn(
+                    "Breakeven",
+                    format="%.2f",
+                    help="Adjusted breakeven after rolls / adjustments"
+                ),
             }
         )
 
@@ -716,7 +724,7 @@ if df_positions is not None and not df_positions.empty:
                                         ] = value
 
                         # ✅ 清洗
-                        for col in ["Strategy", "Notes"]:
+                        for col in ["Strategy", "Notes", "Breakeven"]:
                             if col not in edited_df.columns:
                                 edited_df[col] = ""
 
@@ -729,7 +737,7 @@ if df_positions is not None and not df_positions.empty:
                             )
 
                         # ✅ full_df columns
-                        for col in ["Strategy", "Notes"]:
+                        for col in ["Strategy", "Notes", "Breakeven"]:
                             if col not in full_df.columns:
                                 full_df[col] = ""
 
@@ -763,7 +771,9 @@ if df_positions is not None and not df_positions.empty:
                         full_df["_TradeKey"] = make_key(full_df)
                         edited_df["_TradeKey"] = make_key(edited_df)
 
-                        updates = edited_df[["_TradeKey", "Strategy", "Notes"]].copy()
+                        updates = edited_df[
+                            ["_TradeKey", "Strategy", "Notes", "Breakeven"]
+                        ].copy()
                         updates = updates.drop_duplicates(subset=["_TradeKey"], keep="last")
 
                         full_df = full_df.merge(
@@ -773,7 +783,7 @@ if df_positions is not None and not df_positions.empty:
                             suffixes=("", "_new")
                         )
 
-                        for col in ["Strategy", "Notes"]:
+                        for col in ["Strategy", "Notes", "Breakeven"]:
                             new_col = f"{col}_new"
                             if new_col in full_df.columns:
                                 full_df[col] = full_df[new_col].combine_first(full_df[col])
