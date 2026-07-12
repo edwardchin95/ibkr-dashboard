@@ -1015,7 +1015,7 @@ class MoomooGUI(tk.Tk):
 
         # Date range
         today = datetime.now()
-        default_start = (today - timedelta(days=365)).strftime("%Y-%m-%d")
+        default_start = (today - timedelta(days=6)).strftime("%Y-%m-%d")
         default_end = today.strftime("%Y-%m-%d")
 
         ttk.Label(self, text="Start Date (YYYY-MM-DD):").grid(row=1, column=0, sticky="w", **pad)

@@ -242,11 +242,21 @@ nav_change = 0
 nav_pct = 0
 
 def _prev_nav(df, current_nav):
-    if not df.empty and len(df) > 1 and "NAV" in df.columns:
+
+    if df.empty or "NAV" not in df.columns:
+        return current_nav
+
+    if "Timestamp" not in df.columns:
+        return current_nav
+
+    df_sorted = df.sort_values("Timestamp")
+
+    if len(df_sorted) >= 2:
         try:
-            return float(df.iloc[-2]["NAV"])
+            return float(df_sorted.iloc[-2]["NAV"])
         except:
             return current_nav
+
     return current_nav
 
 if platform_filter == "IBKR":

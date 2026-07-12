@@ -11,6 +11,73 @@ st.set_page_config(
 )
 
 # ============================================================
+# Market Calendars (NYSE + SGX) — for gap detection
+# ============================================================
+try:
+    import pandas_market_calendars as mcal
+    _NYSE = mcal.get_calendar("NYSE")
+    _SGX = mcal.get_calendar("SGX")
+    _HAS_MCAL = True
+except Exception:
+    _NYSE = None
+    _SGX = None
+    _HAS_MCAL = False
+
+
+def _get_open_trading_days(start_date, end_date):
+    """
+    Return a set of dates where at least ONE market
+    (NYSE or SGX) is open in the given range.
+
+    Fallback (if pandas_market_calendars not installed):
+    treat all weekdays as trading days.
+    """
+
+    start = pd.to_datetime(start_date).date()
+    end = pd.to_datetime(end_date).date()
+
+    if _HAS_MCAL:
+
+        nyse_days = set(
+            _NYSE.schedule(
+                start_date=start,
+                end_date=end
+            ).index.date
+        )
+
+        sgx_days = set(
+            _SGX.schedule(
+                start_date=start,
+                end_date=end
+            ).index.date
+        )
+
+        return nyse_days | sgx_days
+
+    # Fallback: use weekdays only
+    days = set()
+    current = pd.to_datetime(start)
+    end_dt = pd.to_datetime(end)
+
+    while current <= end_dt:
+        if current.weekday() < 5:  # Mon–Fri
+            days.add(current.date())
+        current += pd.Timedelta(days=1)
+
+    return days
+
+
+def _gap_has_trading_day(start_date, end_date):
+    """
+    True if the date range contains at least 1 day
+    where NYSE or SGX is open.
+    """
+    return len(
+        _get_open_trading_days(start_date, end_date)
+    ) > 0
+
+
+# ============================================================
 # Constants
 # ============================================================
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "Welcome#123")
@@ -358,6 +425,10 @@ def detect_platform(file_bytes):
 # COVERAGE / GAP DETECTION
 # (Reads from portfolio_history.csv SnapshotFile names)
 # Shared by IBKR / Tiger / Moomoo pages
+#
+# Gap filtering uses NYSE + SGX market calendars:
+# a gap is only real if at least 1 trading day
+# (US OR SG market open) exists in that range.
 # ============================================================
 
 def _extract_dates_from_filename(snapshot_file):
@@ -380,18 +451,32 @@ def _extract_dates_from_filename(snapshot_file):
         return None, None
 
 
+def _count_trading_days(start_date, end_date):
+    """
+    Count trading days (NYSE ∪ SGX open) between two dates inclusive.
+    Fallback: count weekdays if pandas_market_calendars unavailable.
+    """
+    return len(
+        _get_open_trading_days(start_date, end_date)
+    )
+
+
 def detect_coverage_gaps(platform):
     """
     Detect gaps in statement coverage by reading SnapshotFile names
     from portfolio_history.csv.
+
+    Weekends and US/SG public holidays are excluded from
+    gap detection — a gap is only reported if at least
+    one trading day (NYSE OR SGX open) is missing.
 
     Returns:
       {
         "ranges":   [(start, end), ...],
         "gaps":     [(gap_start, gap_end), ...],
         "overlaps": [(a, b), ...],
-        "total_days":   int,
-        "covered_days": int,
+        "total_days":   int,   # trading days
+        "covered_days": int,   # trading days
       }
     """
     result = {
@@ -450,22 +535,34 @@ def detect_coverage_gaps(platform):
             else:
                 merged.append([s, e])
 
-    # Gaps between merged ranges
+    # Raw gaps between merged ranges
+    raw_gaps = []
     for i in range(1, len(merged)):
         gap_start = merged[i - 1][1] + timedelta(days=1)
         gap_end = merged[i][0] - timedelta(days=1)
         if gap_start <= gap_end:
-            result["gaps"].append(
-                (gap_start.strftime("%Y-%m-%d"), gap_end.strftime("%Y-%m-%d"))
+            raw_gaps.append((gap_start, gap_end))
+
+    # ⭐ Filter: keep only gaps that contain at least 1 trading day
+    # (NYSE OR SGX open). Weekend-only or holiday-only gaps are dropped.
+    filtered_gaps = []
+    for gs, ge in raw_gaps:
+        if _gap_has_trading_day(gs, ge):
+            filtered_gaps.append(
+                (gs.strftime("%Y-%m-%d"), ge.strftime("%Y-%m-%d"))
             )
 
+    result["gaps"] = filtered_gaps
+
+    # Count coverage in TRADING DAYS (not calendar days)
     overall_start = merged[0][0]
     overall_end = merged[-1][1]
-    total_days = (overall_end - overall_start).days + 1
+
+    total_days = _count_trading_days(overall_start, overall_end)
 
     covered_days = 0
     for s, e in merged:
-        covered_days += (e - s).days + 1
+        covered_days += _count_trading_days(s, e)
 
     result["total_days"] = total_days
     result["covered_days"] = covered_days
@@ -482,7 +579,7 @@ def get_coverage_summary(platform):
         return f"⚠️ 没有 {platform} statement coverage 记录。"
 
     lines.append(f"📅 {platform} 已上传 {len(info['ranges'])} 份 statement")
-    lines.append(f"   覆盖 {info['covered_days']} / {info['total_days']} 天")
+    lines.append(f"   覆盖 {info['covered_days']} / {info['total_days']} 交易日")
 
     if info["gaps"]:
         lines.append(f"\n⚠️ 检测到 {len(info['gaps'])} 个日期缺口：")
