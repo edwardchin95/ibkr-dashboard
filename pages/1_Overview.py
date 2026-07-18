@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import os
+import yfinance as yf
 
 st.set_page_config(page_title="Overview", page_icon="📊", layout="wide")
 
@@ -65,7 +66,6 @@ uploaded_file = st.sidebar.file_uploader(
     key="overview_upload"
 )
 
-# 🔥 Platform Filter
 platform_filter = st.sidebar.selectbox(
     "🔍 平台筛选",
     ["All", "IBKR", "Tiger", "Moomoo"],
@@ -115,14 +115,12 @@ if uploaded_file is not None:
     elif platform == "Tiger":
         uploaded_file.seek(0)
         tiger_save_snapshot_and_history(uploaded_file)
-
         st.sidebar.success("✅ Tiger 数据已更新")
         st.cache_data.clear()
 
     elif platform == "Moomoo":
         uploaded_file.seek(0)
         moomoo_save_snapshot_and_history(uploaded_file)
-
         st.sidebar.success("✅ Moomoo 数据已更新")
         st.cache_data.clear()
 
@@ -136,7 +134,7 @@ ibkr_loaded = ibkr_load_latest_snapshot()
 tiger_loaded = tiger_load_latest_snapshot()
 moomoo_loaded = moomoo_load_latest_snapshot()
 
-# IBKR data
+# IBKR
 ibkr_nav = ibkr_cash = ibkr_pnl = 0
 ibkr_deposit = ibkr_withdrawal = ibkr_other = 0
 ibkr_positions = pd.DataFrame()
@@ -152,7 +150,7 @@ if ibkr_loaded is not None:
     ibkr_withdrawal = float(ibkr_loaded.get("withdrawal", 0))
     ibkr_other = float(ibkr_loaded.get("other", 0))
 
-# Tiger data
+# Tiger
 tiger_nav = tiger_cash_v = tiger_pnl = 0
 tiger_deposit = tiger_withdrawal = tiger_other = 0
 tiger_positions = pd.DataFrame()
@@ -168,7 +166,7 @@ if tiger_loaded is not None:
     tiger_withdrawal = float(tiger_loaded.get("withdrawal", 0))
     tiger_other = float(tiger_loaded.get("other", 0))
 
-# Moomoo data
+# Moomoo
 moomoo_nav = moomoo_cash_v = moomoo_pnl = 0
 moomoo_deposit = moomoo_withdrawal = moomoo_other = 0
 moomoo_positions = pd.DataFrame()
@@ -231,32 +229,26 @@ else:  # All
     total_withdrawal = ibkr_withdrawal + tiger_withdrawal + moomoo_withdrawal
     total_other = ibkr_other + tiger_other + moomoo_other
 
-# ⭐ Net Capital = Deposit + Withdrawal (withdrawal is negative)
 net_capital = total_deposit + total_withdrawal
 
 # ============================================================
-# PREVIOUS NAV (跟 filter 走)
+# PREVIOUS NAV
 # ============================================================
 previous_nav = total_nav
 nav_change = 0
 nav_pct = 0
 
 def _prev_nav(df, current_nav):
-
     if df.empty or "NAV" not in df.columns:
         return current_nav
-
     if "Timestamp" not in df.columns:
         return current_nav
-
     df_sorted = df.sort_values("Timestamp")
-
     if len(df_sorted) >= 2:
         try:
             return float(df_sorted.iloc[-2]["NAV"])
         except:
             return current_nav
-
     return current_nav
 
 if platform_filter == "IBKR":
@@ -275,13 +267,10 @@ else:
 nav_change = total_nav - previous_nav
 nav_pct = (nav_change / previous_nav * 100) if previous_nav != 0 else 0
 
-# ============================================================
-# PORTFOLIO RETURN
-# ============================================================
 portfolio_return = total_nav - net_capital
 
 # ============================================================
-# REALIZED PROFIT / LOSS (按 filter)
+# REALIZED
 # ============================================================
 ibkr_realized = ibkr_load_realized_pnl_summary()
 tiger_realized = tiger_load_realized_pnl_summary_sgd()
@@ -324,7 +313,6 @@ nc_color = "#66FF99" if net_capital >= 0 else "#FF6666"
 progress = 0
 if target_nav != 0:
     progress = total_nav / target_nav * 100
-
 remaining = target_nav - total_nav
 
 st.markdown(f"""
@@ -431,7 +419,7 @@ background: linear-gradient(90deg, #00D4FF, #4A7BFF);'>
 """, unsafe_allow_html=True)
 
 # ============================================================
-# ANALYZE POSITIONS
+# ANALYZE POSITIONS (aggregate, for tabs & charts)
 # ============================================================
 analysis = analyze_positions(df_positions, total_nav, cash_sgd)
 
@@ -448,7 +436,6 @@ cash_pct = analysis["cash_pct"]
 stock_nav_sgd_local = analysis["stock_nav_sgd"]
 option_nav_sgd_local = analysis["option_nav_sgd"]
 
-# Merge ETF/Stock 同 symbol 跨平台
 def _merge_by_symbol(positions_list):
     merged = {}
     for p in positions_list:
@@ -462,6 +449,374 @@ def _merge_by_symbol(positions_list):
 if platform_filter == "All":
     index_etf_positions = _merge_by_symbol(index_etf_positions)
     stock_positions = _merge_by_symbol(stock_positions)
+
+# ============================================================
+# 🚨 OPTIONS 到期警报 (per-platform tagged)
+# ============================================================
+
+# Platform badge colors
+PLATFORM_BADGE = {
+    "IBKR":   {"bg": "#00D4FF", "fg": "#000"},
+    "Tiger":  {"bg": "#FFC300", "fg": "#000"},
+    "Moomoo": {"bg": "#FF6699", "fg": "#000"},
+}
+
+def _get_platform_options(pos_df, platform_name, nav, cash):
+    """Run analyze_positions per platform and tag Platform on each option."""
+    if pos_df is None or pos_df.empty:
+        return []
+
+    # ⭐ Normalize Put/Call so Moomoo "CALL"/"PUT" becomes "C"/"P"
+    # (matches IBKR & Tiger format for analyze_positions)
+    pos_df = pos_df.copy()
+    if "Put/Call" in pos_df.columns:
+        pos_df["Put/Call"] = (
+            pos_df["Put/Call"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+            .replace({"CALL": "C", "PUT": "P"})
+        )
+
+    a = analyze_positions(pos_df, nav, cash)
+    ops = a.get("option_positions", []) or []
+    tagged = []
+    for op in ops:
+        op = dict(op)  # copy to avoid mutation
+        op["Platform"] = platform_name
+        tagged.append(op)
+    return tagged
+
+# Build platform-tagged option list based on filter
+all_option_positions = []
+
+if platform_filter == "All":
+    all_option_positions += _get_platform_options(ibkr_positions, "IBKR", ibkr_nav, ibkr_cash)
+    all_option_positions += _get_platform_options(tiger_positions, "Tiger", tiger_nav, tiger_cash_v)
+    all_option_positions += _get_platform_options(moomoo_positions, "Moomoo", moomoo_nav, moomoo_cash_v)
+elif platform_filter == "IBKR":
+    all_option_positions = _get_platform_options(ibkr_positions, "IBKR", ibkr_nav, ibkr_cash)
+elif platform_filter == "Tiger":
+    all_option_positions = _get_platform_options(tiger_positions, "Tiger", tiger_nav, tiger_cash_v)
+elif platform_filter == "Moomoo":
+    all_option_positions = _get_platform_options(moomoo_positions, "Moomoo", moomoo_nav, moomoo_cash_v)
+
+
+if len(all_option_positions) > 0:
+
+    expiring_7d = []
+    expiring_14d = []
+    expiring_30d = []
+
+    for op in all_option_positions:
+        dte = op.get("DTE")
+        if dte is None:
+            continue
+        try:
+            dte = int(dte)
+        except:
+            continue
+        if dte < 0:
+            continue
+        if dte <= 7:
+            expiring_7d.append(op)
+        elif dte <= 14:
+            expiring_14d.append(op)
+        elif dte <= 30:
+            expiring_30d.append(op)
+
+    if expiring_7d or expiring_14d or expiring_30d:
+
+        st.markdown(
+            "<div class='section-title'>⚠️ Options 到期警报</div>",
+            unsafe_allow_html=True
+        )
+
+        def render_expiry_group(title, items, accent_color):
+            if not items:
+                return
+
+            rows_html = ""
+            for op in sorted(items, key=lambda x: x.get("DTE", 999)):
+                dte = op.get("DTE", "?")
+                category = op.get("Category", "Other")
+                underlying = op.get("Underlying", "")
+                strike = op.get("Strike", "")
+                qty = op.get("Quantity", 0)
+                plat = op.get("Platform", "?")
+
+                try:
+                    strike_str = f"${float(strike):,.0f}"
+                except:
+                    strike_str = str(strike)
+
+                badge = PLATFORM_BADGE.get(plat, {"bg": "#666", "fg": "#fff"})
+                badge_html = (
+                    f"<span style='background:{badge['bg']}; color:{badge['fg']}; "
+                    f"padding:2px 8px; border-radius:6px; font-size:11px; "
+                    f"font-weight:bold; margin-right:10px;'>{plat}</span>"
+                )
+
+                rows_html += (
+                    f"<div style='display:flex; justify-content:space-between; padding:10px 0; "
+                    f"border-bottom:1px solid #2A2A2A; flex-wrap:wrap; gap:8px;'>"
+                    f"<div>"
+                    f"{badge_html}"
+                    f"<span style='color:white; font-weight:bold;'>{underlying}</span>"
+                    f"<span style='color:gray; margin-left:8px;'>{category} {strike_str}</span>"
+                    f"</div>"
+                    f"<div style='text-align:right;'>"
+                    f"<span style='color:{accent_color}; font-weight:bold;'>{dte}d</span>"
+                    f"<span style='color:gray; margin-left:8px;'>x{int(abs(qty))}</span>"
+                    f"</div>"
+                    f"</div>"
+                )
+
+            card_html = (
+                f"<div class='card' style='padding:20px; border-left:4px solid {accent_color};'>"
+                f"<div style='color:{accent_color}; font-weight:bold; margin-bottom:12px; font-size:16px;'>"
+                f"{title} ({len(items)})"
+                f"</div>"
+                f"{rows_html}"
+                f"</div>"
+            )
+
+            st.markdown(card_html, unsafe_allow_html=True)
+
+        render_expiry_group("🔴 7 天内到期", expiring_7d, "#FF6666")
+        render_expiry_group("🟡 8-14 天到期", expiring_14d, "#FFC300")
+        render_expiry_group("🟢 15-30 天到期", expiring_30d, "#00D4AA")
+
+
+# ============================================================
+# 🚨 BUFFER ALERT (Distance to Breakeven)
+# ============================================================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_price(ticker):
+    """
+    Fetch current stock price via yfinance.
+    Cached for 5 minutes to avoid hammering Yahoo on every rerun.
+    """
+    try:
+        t = yf.Ticker(ticker)
+
+        # fast_info is the quickest path
+        fi = getattr(t, "fast_info", None)
+        if fi is not None:
+            for key in ("last_price", "lastPrice", "regularMarketPrice"):
+                try:
+                    val = fi.get(key) if hasattr(fi, "get") else getattr(fi, key, None)
+                    if val is not None and float(val) > 0:
+                        return float(val)
+                except:
+                    continue
+
+        # Fallback: history
+        hist = t.history(period="1d")
+        if not hist.empty:
+            return float(hist["Close"].iloc[-1])
+
+    except Exception:
+        return None
+
+    return None
+
+
+def _load_journal_map():
+    """
+    Read trades_history.csv → latest Group + Breakeven
+    per (Platform, Underlying).
+    """
+    from app import TRADES_HISTORY_FILE
+
+    if not os.path.exists(TRADES_HISTORY_FILE):
+        return {}
+
+    try:
+        df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+    except:
+        return {}
+
+    if df.empty:
+        return {}
+
+    for col in ["Platform", "Symbol", "Group", "Breakeven", "TradeDate"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    def _underlying(sym):
+        s = str(sym).strip().upper()
+        if not s:
+            return ""
+        return s.split(" ")[0]
+
+    df["Underlying"] = df["Symbol"].apply(_underlying)
+
+    df = df.sort_values("TradeDate")
+
+    journal = {}
+    for _, row in df.iterrows():
+
+        plat = str(row.get("Platform", "")).strip()
+        und = str(row.get("Underlying", "")).strip().upper()
+        grp = str(row.get("Group", "")).strip()
+        be_raw = str(row.get("Breakeven", "")).strip()
+
+        if not plat or not und:
+            continue
+
+        try:
+            be = float(be_raw) if be_raw else None
+        except:
+            be = None
+
+        key = (plat, und)
+
+        if key not in journal:
+            journal[key] = {"group": "", "breakeven": None}
+
+        if grp:
+            journal[key]["group"] = grp
+        if be is not None:
+            journal[key]["breakeven"] = be
+
+    return journal
+
+
+journal_map = _load_journal_map()
+
+# Build buffer alert data
+buffer_rows = []
+
+for op in all_option_positions:
+
+    plat = op.get("Platform", "")
+    und = str(op.get("Underlying", "")).strip().upper()
+
+    if not und:
+        continue
+
+    j = journal_map.get((plat, und), {})
+    group = j.get("group", "")
+    be = j.get("breakeven")
+
+    if be is None or be <= 0:
+        continue  # Skip if no breakeven set
+
+    # ⭐ Fetch live price via yfinance
+    current = _fetch_price(und)
+
+    if current is None or current <= 0:
+        continue
+
+    buffer_pct = (current - be) / be * 100
+
+    buffer_rows.append({
+        "Platform": plat,
+        "Underlying": und,
+        "Group": group,
+        "Category": op.get("Category", ""),
+        "Strike": op.get("Strike", ""),
+        "Current": current,
+        "Breakeven": be,
+        "Buffer": buffer_pct,
+        "DTE": op.get("DTE", "?"),
+        "Quantity": op.get("Quantity", 0),
+    })
+
+# Dedupe by (Platform, Underlying) — 1 row per campaign
+seen = set()
+unique_rows = []
+for r in sorted(buffer_rows, key=lambda x: x["Buffer"]):
+    key = (r["Platform"], r["Underlying"])
+    if key in seen:
+        continue
+    seen.add(key)
+    unique_rows.append(r)
+
+# Severity buckets
+danger = [r for r in unique_rows if r["Buffer"] < 5]
+warning = [r for r in unique_rows if 5 <= r["Buffer"] < 10]
+
+if danger or warning:
+
+    st.markdown(
+        "<div class='section-title'>🚨 Buffer Alert (距离 Breakeven)</div>",
+        unsafe_allow_html=True
+    )
+
+    def render_buffer_group(title, items, accent_color):
+        if not items:
+            return
+
+        rows_html = ""
+        for r in items:
+
+            plat = r["Platform"]
+            badge = PLATFORM_BADGE.get(plat, {"bg": "#666", "fg": "#fff"})
+            badge_html = (
+                f"<span style='background:{badge['bg']}; color:{badge['fg']}; "
+                f"padding:2px 8px; border-radius:6px; font-size:11px; "
+                f"font-weight:bold; margin-right:10px;'>{plat}</span>"
+            )
+
+            try:
+                strike_str = f"${float(r['Strike']):,.0f}"
+            except:
+                strike_str = str(r["Strike"])
+
+            group_str = r["Group"] if r["Group"] else "—"
+
+            try:
+                dte_str = f"{int(r['DTE'])}d"
+            except:
+                dte_str = f"{r['DTE']}d"
+
+            rows_html += (
+                f"<div style='display:flex; justify-content:space-between; "
+                f"padding:10px 0; border-bottom:1px solid #2A2A2A; "
+                f"flex-wrap:wrap; gap:8px;'>"
+
+                f"<div>"
+                f"{badge_html}"
+                f"<span style='color:white; font-weight:bold;'>{r['Underlying']}</span>"
+                f"<span style='color:gray; margin-left:8px;'>"
+                f"{r['Category']} {strike_str}"
+                f"</span>"
+                f"<div style='color:#888; font-size:11px; margin-top:4px;'>"
+                f"Group: {group_str} · BE ${r['Breakeven']:,.2f} · "
+                f"Current ${r['Current']:,.2f}"
+                f"</div>"
+                f"</div>"
+
+                f"<div style='text-align:right;'>"
+                f"<span style='color:{accent_color}; font-weight:bold; font-size:16px;'>"
+                f"{r['Buffer']:+.1f}%"
+                f"</span>"
+                f"<div style='color:gray; font-size:11px; margin-top:4px;'>"
+                f"{dte_str} · x{int(abs(r['Quantity']))}"
+                f"</div>"
+                f"</div>"
+
+                f"</div>"
+            )
+
+        card_html = (
+            f"<div class='card' style='padding:20px; "
+            f"border-left:4px solid {accent_color};'>"
+            f"<div style='color:{accent_color}; font-weight:bold; "
+            f"margin-bottom:12px; font-size:16px;'>"
+            f"{title} ({len(items)})"
+            f"</div>"
+            f"{rows_html}"
+            f"</div>"
+        )
+
+        st.markdown(card_html, unsafe_allow_html=True)
+
+    render_buffer_group("🔥 危险 Buffer < 5%", danger, "#FF6666")
+    render_buffer_group("⚠ 警告 Buffer < 10%", warning, "#FFC300")
 
 # ============================================================
 # 🏦 平台占比
@@ -488,11 +843,9 @@ else:
 
 if platform_data:
     platform_df = pd.DataFrame(platform_data)
-
     col1, col2 = st.columns([1, 1])
 
     with col1:
-
         fig_platform = go.Figure(
             data=[
                 go.Pie(
@@ -505,25 +858,17 @@ if platform_data:
                 )
             ]
         )
-
         fig_platform.update_layout(
             paper_bgcolor="#111827",
             plot_bgcolor="#111827",
             font_color="white"
         )
-
         st.plotly_chart(fig_platform, use_container_width=True)
 
     with col2:
-
         st.markdown("### 💰 Platform Holdings")
-
         for _, row in platform_df.iterrows():
-
-            pct = (
-                row["NAV"] / total_nav * 100
-            ) if total_nav != 0 else 0
-
+            pct = (row["NAV"] / total_nav * 100) if total_nav != 0 else 0
             st.markdown(
                 f"""
                 <div style='display:flex;
@@ -532,15 +877,12 @@ if platform_data:
                 border-bottom:1px solid #E5E7EB;
                 flex-wrap:wrap;
                 gap:8px;'>
-
                 <span style='font-weight:bold; color:black;'>
                 {row['Platform']}
                 </span>
-
                 <span style='color:#666;'>
                 SGD ${row['NAV']:,.2f} ({pct:.1f}%)
                 </span>
-
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -575,11 +917,8 @@ st.markdown("### 1️⃣ 总资产配置（% NetLiq）")
 col1, col2 = st.columns([1, 1])
 
 with col1:
-
     bar_labels = ["ETF + Stocks", "Options", "Cash"]
-
     bar_values = [stock_pct_signed, option_pct_signed, cash_pct]
-
     bar_colors = [
         "#4A7BFF",
         "#FF6666" if option_pct_signed < 0 else "#FFB800",
@@ -587,7 +926,6 @@ with col1:
     ]
 
     fig1 = go.Figure()
-
     fig1.add_trace(
         go.Bar(
             x=bar_values,
@@ -598,9 +936,7 @@ with col1:
             textposition="outside"
         )
     )
-
     fig1.add_vline(x=0, line_width=1, line_color="white")
-
     fig1.update_layout(
         paper_bgcolor="#111827",
         plot_bgcolor="#111827",
@@ -610,11 +946,9 @@ with col1:
         showlegend=False,
         height=350
     )
-
     st.plotly_chart(fig1, use_container_width=True)
 
 with col2:
-
     st.markdown("### 🎯 Allocation Targets")
 
     allocation_data = [
@@ -645,7 +979,6 @@ with col2:
     ]
 
     for item in allocation_data:
-
         current_display = item["CurrentDisplay"]
         current_check = item["CurrentCheck"]
         target = item["Target"]
@@ -658,7 +991,6 @@ with col2:
         st.markdown(
             f"""
             <div style='margin-bottom:26px;'>
-
             <div style='display:flex;
             justify-content:space-between;
             color:black;
@@ -666,512 +998,314 @@ with col2:
             margin-bottom:6px;
             flex-wrap:wrap;
             gap:8px;'>
-
-            <span>
-            {status} {item['Name']}
-            </span>
-
-            <span>
-            {current_display:.1f}% ({target}%)
-            </span>
-
+            <span>{status} {item['Name']}</span>
+            <span>{current_display:.1f}% ({target}%)</span>
             </div>
-
-            <div style='color:#666666;
-            margin-bottom:8px;'>
-
+            <div style='color:#666666; margin-bottom:8px;'>
             SGD ${amount:,.2f}
-
             </div>
-
             <div class='progress-container'>
-
             <div class='progress-bar'
             style='width:{min(abs(current_check),100):.1f}%;
             background:{item['Color']};'>
             </div>
-
             </div>
-
             </div>
             """,
             unsafe_allow_html=True
         )
 
 # ============================================================
-# CHART 2 - ETF 分布 + Targets + 金额
+# HOLDINGS TABS (ETF / Stocks / Options / Cash)
 # ============================================================
+tab_etf, tab_stock, tab_option, tab_cash = st.tabs([
+    "📈 ETF",
+    "🏢 Stocks",
+    "📑 Options",
+    "💵 Cash"
+])
 
-if len(index_etf_positions) > 0:
+# ---------- TAB ETF ----------
+with tab_etf:
+    if len(index_etf_positions) > 0:
+        st.markdown("### 2️⃣ 大盘 ETF 分布")
+        col1, col2 = st.columns([1, 1])
 
-    st.markdown("### 2️⃣ 大盘 ETF 分布")
+        with col1:
+            etf_labels = [p["Symbol"] for p in index_etf_positions]
+            etf_values = [p["Value"] for p in index_etf_positions]
+            fig2 = go.Figure(data=[go.Pie(
+                labels=etf_labels, values=etf_values, hole=0.65,
+                textinfo="label+percent",
+                textfont=dict(color="white", size=14),
+                showlegend=False
+            )])
+            fig2.update_layout(
+                paper_bgcolor="#111827",
+                plot_bgcolor="#111827",
+                font_color="white"
+            )
+            st.plotly_chart(fig2, use_container_width=True)
 
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-
-        etf_labels = [p["Symbol"] for p in index_etf_positions]
-        etf_values = [p["Value"] for p in index_etf_positions]
-
-        fig2 = go.Figure(
-            data=[
-                go.Pie(
-                    labels=etf_labels,
-                    values=etf_values,
-                    hole=0.65,
-                    textinfo="label+percent",
-                    textfont=dict(color="white", size=14),
-                    showlegend=False
-                )
-            ]
-        )
-
-        fig2.update_layout(
-            paper_bgcolor="#111827",
-            plot_bgcolor="#111827",
-            font_color="white"
-        )
-
-        st.plotly_chart(fig2, use_container_width=True)
-
-    with col2:
-
+        with col2:
             st.markdown("### 💰 ETF Holdings")
-
             for p in index_etf_positions:
                 value_sgd = p["Value"]
-                pct = (
-                    value_sgd / total_nav * 100
-                ) if total_nav != 0 else 0
-
+                pct = (value_sgd / total_nav * 100) if total_nav != 0 else 0
                 st.markdown(
                     f"""
-                    <div style='display:flex;
-                    justify-content:space-between;
-                    padding:12px 0;
-                    border-bottom:1px solid #E5E7EB;
-                    flex-wrap:wrap;
-                    gap:8px;'>
-
-                    <span style='font-weight:bold; color:black;'>
-                    {p['Symbol']}
-                    </span>
-
-                    <span style='color:#666;'>
-                    SGD ${value_sgd:,.2f} ({pct:.1f}%)
-                    </span>
-
+                    <div style='display:flex; justify-content:space-between;
+                    padding:12px 0; border-bottom:1px solid #E5E7EB;
+                    flex-wrap:wrap; gap:8px;'>
+                    <span style='font-weight:bold; color:black;'>{p['Symbol']}</span>
+                    <span style='color:#666;'>SGD ${value_sgd:,.2f} ({pct:.1f}%)</span>
                     </div>
                     """,
                     unsafe_allow_html=True
                 )
-
             etf_total_sgd = sum(p["Value"] for p in index_etf_positions)
             st.markdown(
                 f"""
-                <div style='display:flex;
-                justify-content:space-between;
-                padding:12px 0;
-                border-top:2px solid #333;
-                flex-wrap:wrap;
-                gap:8px;'>
-
-                <span style='font-weight:bold; color:black; font-size:18px;'>
-                Total
-                </span>
-
-                <span style='font-weight:bold; color:black; font-size:18px;'>
-                SGD ${etf_total_sgd:,.2f}
-                </span>
-
+                <div style='display:flex; justify-content:space-between;
+                padding:12px 0; border-top:2px solid #333;
+                flex-wrap:wrap; gap:8px;'>
+                <span style='font-weight:bold; color:black; font-size:18px;'>Total</span>
+                <span style='font-weight:bold; color:black; font-size:18px;'>SGD ${etf_total_sgd:,.2f}</span>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
+    else:
+        st.info("暂无 ETF 持仓")
 
-# ============================================================
-# CHART 3 - 个股分布 + Targets + 金额
-# ============================================================
+# ---------- TAB STOCK ----------
+with tab_stock:
+    if len(stock_positions) > 0:
+        st.markdown("### 3️⃣ 个股分布")
+        col1, col2 = st.columns([1, 1])
 
-if len(stock_positions) > 0:
-
-    st.markdown("### 3️⃣ 个股分布")
-
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-
-        stock_labels = [p["Symbol"] for p in stock_positions]
-        stock_values = [p["Value"] for p in stock_positions]
-
-        fig3 = go.Figure(
-            data=[
-                go.Pie(
-                    labels=stock_labels,
-                    values=stock_values,
-                    hole=0.65,
-                    textinfo="label+percent",
-                    textfont=dict(color="white", size=14),
-                    showlegend=False
-                )
-            ]
-        )
-
-        fig3.update_layout(
-            paper_bgcolor="#111827",
-            plot_bgcolor="#111827",
-            font_color="white"
-        )
-
-        st.plotly_chart(fig3, use_container_width=True)
-
-    with col2:
-
-        st.markdown("### 🎯 Individual Stock Targets")
-
-        for p in stock_positions:
-
-            value_sgd = p["Value"]
-
-            pct = (
-                value_sgd / total_nav * 100
-            ) if total_nav != 0 else 0
-
-            target = TARGET_SINGLE_STOCK
-            warning = "✅"
-
-            if pct > target:
-                warning = "⚠️"
-
-            st.markdown(
-                f"""
-                <div style='margin-bottom:26px;'>
-
-                <div style='display:flex;
-                justify-content:space-between;
-                color:black;
-                font-weight:bold;
-                margin-bottom:6px;
-                flex-wrap:wrap;
-                gap:8px;'>
-
-                <span>
-                {warning} {p['Symbol']}
-                </span>
-
-                <span>
-                {pct:.1f}% ({target}%)
-                </span>
-
-                </div>
-
-                <div style='color:#666666;
-                margin-bottom:8px;'>
-
-                SGD ${value_sgd:,.2f}
-
-                </div>
-
-                <div class='progress-container'>
-
-                <div class='progress-bar'
-                style='width:{min(pct,100):.1f}%;
-                background:#00D4AA;'>
-                </div>
-
-                </div>
-
-                </div>
-                """,
-                unsafe_allow_html=True
+        with col1:
+            stock_labels = [p["Symbol"] for p in stock_positions]
+            stock_values = [p["Value"] for p in stock_positions]
+            fig3 = go.Figure(data=[go.Pie(
+                labels=stock_labels, values=stock_values, hole=0.65,
+                textinfo="label+percent",
+                textfont=dict(color="white", size=14),
+                showlegend=False
+            )])
+            fig3.update_layout(
+                paper_bgcolor="#111827",
+                plot_bgcolor="#111827",
+                font_color="white"
             )
+            st.plotly_chart(fig3, use_container_width=True)
 
-        stock_total_sgd = sum(p["Value"] for p in stock_positions)
-        st.markdown(
-            f"""
-            <div style='display:flex;
-            justify-content:space-between;
-            padding:12px 0;
-            border-top:2px solid #333;
-            flex-wrap:wrap;
-            gap:8px;'>
-
-            <span style='font-weight:bold; color:black; font-size:18px;'>
-            Total
-            </span>
-
-            <span style='font-weight:bold; color:black; font-size:18px;'>
-            SGD ${stock_total_sgd:,.2f}
-            </span>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-# ============================================================
-# CHART 4 - 期权分布 + Targets + 金额
-# ============================================================
-
-if len(option_positions) > 0:
-
-    st.markdown("### 4️⃣ 期权持仓分布（Exposure）")
-
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-
-        option_labels = [
-            k for k, v in option_categories.items()
-            if v > 0
-        ]
-
-        option_values = [
-            v for k, v in option_categories.items()
-            if v > 0
-        ]
-
-        option_colors = [
-            OPTION_COLORS.get(k, "#9CA3AF")
-            for k, v in option_categories.items()
-            if v > 0
-        ]
-
-        fig4 = go.Figure(
-            data=[
-                go.Pie(
-                    labels=option_labels,
-                    values=option_values,
-                    hole=0.65,
-                    marker_colors=option_colors,
-                    textinfo="label+percent",
-                    textfont=dict(color="white", size=14),
-                    showlegend=False
-                )
-            ]
-        )
-
-        fig4.update_layout(
-            paper_bgcolor="#111827",
-            plot_bgcolor="#111827",
-            font_color="white"
-        )
-
-        st.plotly_chart(fig4, use_container_width=True)
-
-    with col2:
-
-            st.markdown("### 💰 Options Holdings")
-
-            for category, exposure in option_categories.items():
-
-                if exposure <= 0:
-                    continue
-
-                exposure_sgd = exposure
-
-                pct = (
-                    exposure_sgd / option_total_exposure * 100
-                ) if option_total_exposure != 0 else 0
-
-                color = OPTION_COLORS.get(category, "#9CA3AF")
-
+        with col2:
+            st.markdown("### 🎯 Individual Stock Targets")
+            for p in stock_positions:
+                value_sgd = p["Value"]
+                pct = (value_sgd / total_nav * 100) if total_nav != 0 else 0
+                target = TARGET_SINGLE_STOCK
+                warning = "✅"
+                if pct > target:
+                    warning = "⚠️"
                 st.markdown(
                     f"""
-                    <div style='display:flex;
-                    justify-content:space-between;
-                    padding:12px 0;
-                    border-bottom:1px solid #E5E7EB;
-                    flex-wrap:wrap;
-                    gap:8px;'>
-
-                    <span style='font-weight:bold; color:black;'>
-                    <span style='color:{color};'>●</span> {category}
-                    </span>
-
-                    <span style='color:#666;'>
-                    SGD ${exposure_sgd:,.2f} ({pct:.1f}%)
-                    </span>
-
+                    <div style='margin-bottom:26px;'>
+                    <div style='display:flex; justify-content:space-between;
+                    color:black; font-weight:bold; margin-bottom:6px;
+                    flex-wrap:wrap; gap:8px;'>
+                    <span>{warning} {p['Symbol']}</span>
+                    <span>{pct:.1f}% ({target}%)</span>
+                    </div>
+                    <div style='color:#666666; margin-bottom:8px;'>
+                    SGD ${value_sgd:,.2f}
+                    </div>
+                    <div class='progress-container'>
+                    <div class='progress-bar'
+                    style='width:{min(pct,100):.1f}%; background:#00D4AA;'>
+                    </div>
+                    </div>
                     </div>
                     """,
                     unsafe_allow_html=True
                 )
 
-            option_total_sgd = sum(
-                v for v in option_categories.values() if v > 0
-            )
+            stock_total_sgd = sum(p["Value"] for p in stock_positions)
             st.markdown(
                 f"""
-                <div style='display:flex;
-                justify-content:space-between;
-                padding:12px 0;
-                border-top:2px solid #333;
-                flex-wrap:wrap;
-                gap:8px;'>
+                <div style='display:flex; justify-content:space-between;
+                padding:12px 0; border-top:2px solid #333;
+                flex-wrap:wrap; gap:8px;'>
+                <span style='font-weight:bold; color:black; font-size:18px;'>Total</span>
+                <span style='font-weight:bold; color:black; font-size:18px;'>SGD ${stock_total_sgd:,.2f}</span>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("暂无个股持仓")
 
-                <span style='font-weight:bold; color:black; font-size:18px;'>
-                Total
-                </span>
+# ---------- TAB OPTION ----------
+with tab_option:
+    if len(option_positions) > 0:
+        st.markdown("### 4️⃣ 期权持仓分布（Exposure）")
+        col1, col2 = st.columns([1, 1])
 
-                <span style='font-weight:bold; color:black; font-size:18px;'>
-                SGD ${option_total_sgd:,.2f}
-                </span>
+        with col1:
+            option_labels = [k for k, v in option_categories.items() if v > 0]
+            option_values = [v for k, v in option_categories.items() if v > 0]
+            option_colors = [OPTION_COLORS.get(k, "#9CA3AF")
+                             for k, v in option_categories.items() if v > 0]
 
+            fig4 = go.Figure(data=[go.Pie(
+                labels=option_labels,
+                values=option_values,
+                hole=0.65,
+                marker_colors=option_colors,
+                textinfo="label+percent",
+                textfont=dict(color="white", size=14),
+                showlegend=False
+            )])
+            fig4.update_layout(
+                paper_bgcolor="#111827",
+                plot_bgcolor="#111827",
+                font_color="white"
+            )
+            st.plotly_chart(fig4, use_container_width=True)
+
+        with col2:
+            st.markdown("### 💰 Options Holdings")
+            for category, exposure in option_categories.items():
+                if exposure <= 0:
+                    continue
+                exposure_sgd = exposure
+                pct = (exposure_sgd / option_total_exposure * 100) if option_total_exposure != 0 else 0
+                color = OPTION_COLORS.get(category, "#9CA3AF")
+                st.markdown(
+                    f"""
+                    <div style='display:flex; justify-content:space-between;
+                    padding:12px 0; border-bottom:1px solid #E5E7EB;
+                    flex-wrap:wrap; gap:8px;'>
+                    <span style='font-weight:bold; color:black;'>
+                    <span style='color:{color};'>●</span> {category}
+                    </span>
+                    <span style='color:#666;'>SGD ${exposure_sgd:,.2f} ({pct:.1f}%)</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            option_total_sgd = sum(v for v in option_categories.values() if v > 0)
+            st.markdown(
+                f"""
+                <div style='display:flex; justify-content:space-between;
+                padding:12px 0; border-top:2px solid #333;
+                flex-wrap:wrap; gap:8px;'>
+                <span style='font-weight:bold; color:black; font-size:18px;'>Total</span>
+                <span style='font-weight:bold; color:black; font-size:18px;'>SGD ${option_total_sgd:,.2f}</span>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("暂无期权持仓")
+
+# ---------- TAB CASH ----------
+with tab_cash:
+    if platform_filter == "All":
+        cash_data = []
+        if ibkr_nav > 0:
+            cash_data.append({"Platform": "IBKR", "Cash": ibkr_cash})
+        if tiger_nav > 0:
+            cash_data.append({"Platform": "Tiger", "Cash": tiger_cash_v})
+        if moomoo_nav > 0:
+            cash_data.append({"Platform": "Moomoo", "Cash": moomoo_cash_v})
+    elif platform_filter == "IBKR":
+        cash_data = [{"Platform": "IBKR", "Cash": ibkr_cash}] if ibkr_nav > 0 else []
+    elif platform_filter == "Tiger":
+        cash_data = [{"Platform": "Tiger", "Cash": tiger_cash_v}] if tiger_nav > 0 else []
+    else:
+        cash_data = [{"Platform": "Moomoo", "Cash": moomoo_cash_v}] if moomoo_nav > 0 else []
+
+    total_cash = sum(c["Cash"] for c in cash_data)
+    total_cash_pct = (total_cash / total_nav * 100) if total_nav != 0 else 0
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        fig_cash = go.Figure(data=[go.Pie(
+            labels=["Cash", "Invested"],
+            values=[total_cash, max(0, total_nav - total_cash)],
+            hole=0.7,
+            marker_colors=["#00FF88", "#4A7BFF"],
+            textinfo="label+percent",
+            textfont=dict(color="white", size=14),
+            showlegend=False
+        )])
+        fig_cash.update_layout(
+            paper_bgcolor="#111827",
+            plot_bgcolor="#111827",
+            font_color="white",
+            showlegend=False
+        )
+        st.plotly_chart(fig_cash, use_container_width=True)
+
+    with col2:
+        st.markdown("### 💵 Cash by Platform")
+        for c in cash_data:
+            pct = (c["Cash"] / total_nav * 100) if total_nav != 0 else 0
+            st.markdown(
+                f"""
+                <div style='display:flex; justify-content:space-between;
+                padding:12px 0; border-bottom:1px solid #E5E7EB;
+                flex-wrap:wrap; gap:8px;'>
+                <span style='font-weight:bold; color:black;'>{c['Platform']}</span>
+                <span style='color:#666;'>SGD ${c['Cash']:,.2f} ({pct:.1f}%)</span>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-# ============================================================
-# CASH（全平台现金汇总）
-# ============================================================
-st.markdown(
-    "<div class='section-title'>💵 现金仓</div>",
-    unsafe_allow_html=True
-)
-
-# Cash data 按 filter 走
-if platform_filter == "All":
-    cash_data = []
-    if ibkr_nav > 0:
-        cash_data.append({"Platform": "IBKR", "Cash": ibkr_cash})
-    if tiger_nav > 0:
-        cash_data.append({"Platform": "Tiger", "Cash": tiger_cash_v})
-    if moomoo_nav > 0:
-        cash_data.append({"Platform": "Moomoo", "Cash": moomoo_cash_v})
-elif platform_filter == "IBKR":
-    cash_data = [{"Platform": "IBKR", "Cash": ibkr_cash}] if ibkr_nav > 0 else []
-elif platform_filter == "Tiger":
-    cash_data = [{"Platform": "Tiger", "Cash": tiger_cash_v}] if tiger_nav > 0 else []
-else:
-    cash_data = [{"Platform": "Moomoo", "Cash": moomoo_cash_v}] if moomoo_nav > 0 else []
-
-total_cash = sum(c["Cash"] for c in cash_data)
-total_cash_pct = (total_cash / total_nav * 100) if total_nav != 0 else 0
-
-col1, col2 = st.columns([1, 1])
-
-with col1:
-
-    fig_cash = go.Figure(
-        data=[
-            go.Pie(
-                labels=["Cash", "Invested"],
-                values=[total_cash, max(0, total_nav - total_cash)],
-                hole=0.7,
-                marker_colors=["#00FF88", "#1A1F2E"],
-                textinfo="label+percent",
-                textfont=dict(color="white", size=14)
-            )
-        ]
-    )
-
-    fig_cash.update_layout(
-        paper_bgcolor="#111827",
-        plot_bgcolor="#111827",
-        font_color="white"
-    )
-
-    st.plotly_chart(fig_cash, use_container_width=True)
-
-with col2:
-
-    st.markdown("### 💵 Cash by Platform")
-
-    for c in cash_data:
-
-        pct = (
-            c["Cash"] / total_nav * 100
-        ) if total_nav != 0 else 0
-
         st.markdown(
             f"""
-            <div style='display:flex;
-            justify-content:space-between;
-            padding:12px 0;
-            border-bottom:1px solid #E5E7EB;
-            flex-wrap:wrap;
-            gap:8px;'>
-
-            <span style='font-weight:bold; color:black;'>
-            {c['Platform']}
+            <div style='display:flex; justify-content:space-between;
+            padding:12px 0; border-top:2px solid #333; margin-bottom:20px;
+            flex-wrap:wrap; gap:8px;'>
+            <span style='font-weight:bold; color:black; font-size:18px;'>Total Cash</span>
+            <span style='font-weight:bold; color:black; font-size:18px;'>
+            SGD ${total_cash:,.2f} ({total_cash_pct:.1f}%)
             </span>
-
-            <span style='color:#666;'>
-            SGD ${c['Cash']:,.2f} ({pct:.1f}%)
-            </span>
-
             </div>
             """,
             unsafe_allow_html=True
         )
 
-    st.markdown(
-        f"""
-        <div style='display:flex;
-        justify-content:space-between;
-        padding:12px 0;
-        border-top:2px solid #333;
-        margin-bottom:20px;
-        flex-wrap:wrap;
-        gap:8px;'>
+        status = "✅"
+        if total_cash_pct > TARGET_CASH:
+            status = "⚠️"
 
-        <span style='font-weight:bold; color:black; font-size:18px;'>
-        Total Cash
-        </span>
-
-        <span style='font-weight:bold; color:black; font-size:18px;'>
-        SGD ${total_cash:,.2f} ({total_cash_pct:.1f}%)
-        </span>
-
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    status = "✅"
-    if total_cash_pct > TARGET_CASH:
-        status = "⚠️"
-
-    st.markdown(
-        f"""
-        <div style='margin-bottom:26px;'>
-
-        <div style='display:flex;
-        justify-content:space-between;
-        color:black;
-        font-weight:bold;
-        margin-bottom:6px;
-        flex-wrap:wrap;
-        gap:8px;'>
-
-        <span>
-        {status} Cash Target
-        </span>
-
-        <span>
-        {total_cash_pct:.1f}% ({TARGET_CASH}%)
-        </span>
-
-        </div>
-
-        <div class='progress-container'>
-
-        <div class='progress-bar'
-        style='width:{min(total_cash_pct,100):.1f}%;
-        background:#00D4AA;'>
-        </div>
-
-        </div>
-
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+        st.markdown(
+            f"""
+            <div style='margin-bottom:26px;'>
+            <div style='display:flex; justify-content:space-between;
+            color:black; font-weight:bold; margin-bottom:6px;
+            flex-wrap:wrap; gap:8px;'>
+            <span>{status} Cash Target</span>
+            <span>{total_cash_pct:.1f}% ({TARGET_CASH}%)</span>
+            </div>
+            <div class='progress-container'>
+            <div class='progress-bar'
+            style='width:{min(total_cash_pct,100):.1f}%; background:#00D4AA;'>
+            </div>
+            </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
 # ============================================================
-# POSITION DETAILS（已经含 Platform 列）
+# POSITION DETAILS
 # ============================================================
 st.markdown(
     "<div class='section-title'>📋 持仓明细</div>",
@@ -1197,7 +1331,6 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# 决定要画哪条线
 show_ibkr_line = platform_filter in ("All", "IBKR") and not ibkr_history.empty
 show_tiger_line = platform_filter in ("All", "Tiger") and not tiger_history.empty
 show_moomoo_line = platform_filter in ("All", "Moomoo") and not moomoo_history.empty
@@ -1207,76 +1340,77 @@ if show_ibkr_line or show_tiger_line or show_moomoo_line:
     fig_history = go.Figure()
 
     if show_ibkr_line and "Timestamp" in ibkr_history.columns and "NAV" in ibkr_history.columns:
-        fig_history.add_trace(
-            go.Scatter(
-                x=ibkr_history["Timestamp"],
-                y=ibkr_history["NAV"],
-                mode="lines+markers",
-                line=dict(color="#00D4FF", width=3),
-                marker=dict(size=8),
-                name="IBKR"
-            )
-        )
+        fig_history.add_trace(go.Scatter(
+            x=ibkr_history["Timestamp"], y=ibkr_history["NAV"],
+            mode="lines+markers",
+            line=dict(color="#00D4FF", width=3),
+            marker=dict(size=8), name="IBKR"
+        ))
 
     if show_tiger_line and "Timestamp" in tiger_history.columns and "NAV" in tiger_history.columns:
-        fig_history.add_trace(
-            go.Scatter(
-                x=tiger_history["Timestamp"],
-                y=tiger_history["NAV"],
-                mode="lines+markers",
-                line=dict(color="#FFC300", width=3),
-                marker=dict(size=8),
-                name="Tiger"
-            )
-        )
+        fig_history.add_trace(go.Scatter(
+            x=tiger_history["Timestamp"], y=tiger_history["NAV"],
+            mode="lines+markers",
+            line=dict(color="#FFC300", width=3),
+            marker=dict(size=8), name="Tiger"
+        ))
 
     if show_moomoo_line and "Timestamp" in moomoo_history.columns and "NAV" in moomoo_history.columns:
-        fig_history.add_trace(
-            go.Scatter(
-                x=moomoo_history["Timestamp"],
-                y=moomoo_history["NAV"],
-                mode="lines+markers",
-                line=dict(color="#FF6699", width=3),
-                marker=dict(size=8),
-                name="Moomoo"
-            )
-        )
+        fig_history.add_trace(go.Scatter(
+            x=moomoo_history["Timestamp"], y=moomoo_history["NAV"],
+            mode="lines+markers",
+            line=dict(color="#FF6699", width=3),
+            marker=dict(size=8), name="Moomoo"
+        ))
 
-    # All 模式下加 Combined 线
-    if platform_filter == "All" and (
-        sum([show_ibkr_line, show_tiger_line, show_moomoo_line]) > 1
-    ):
+    if platform_filter == "All" and (sum([show_ibkr_line, show_tiger_line, show_moomoo_line]) > 1):
         try:
             frames = [d for d in [ibkr_history, tiger_history, moomoo_history] if not d.empty]
             combined_history_df = pd.concat(frames, ignore_index=True)
             combined_grouped = combined_history_df.groupby("Timestamp")["NAV"].sum().reset_index()
             combined_grouped = combined_grouped.sort_values("Timestamp")
 
-            fig_history.add_trace(
-                go.Scatter(
-                    x=combined_grouped["Timestamp"],
-                    y=combined_grouped["NAV"],
-                    mode="lines+markers",
-                    line=dict(color="#66FF99", width=3, dash="dot"),
-                    marker=dict(size=8),
-                    name="Combined"
-                )
-            )
+            fig_history.add_trace(go.Scatter(
+                x=combined_grouped["Timestamp"], y=combined_grouped["NAV"],
+                mode="lines+markers",
+                line=dict(color="#66FF99", width=3, dash="dot"),
+                marker=dict(size=8), name="Combined"
+            ))
         except:
             pass
 
     fig_history.update_layout(
         paper_bgcolor="#111827",
         plot_bgcolor="#111827",
-        font_color="white",
-        title="Portfolio Equity Curve",
-        xaxis_title="Time",
-        yaxis_title="NAV (SGD)"
+        font=dict(color="white", size=13),
+        title=dict(
+            text="Portfolio Equity Curve",
+            font=dict(color="white", size=18)
+        ),
+        xaxis=dict(
+            title=dict(text="Time", font=dict(color="white")),
+            tickfont=dict(color="white"),
+            gridcolor="#333"
+        ),
+        yaxis=dict(
+            title=dict(text="NAV (SGD)", font=dict(color="white")),
+            tickfont=dict(color="white"),
+            gridcolor="#333"
+        ),
+        legend=dict(
+            font=dict(color="white", size=13),
+            bgcolor="rgba(0,0,0,0)",
+            bordercolor="#333",
+            borderwidth=1
+        ),
+        hoverlabel=dict(
+            bgcolor="#1A1F2E",
+            font_color="white"
+        )
     )
 
     st.plotly_chart(fig_history, use_container_width=True)
 
-    # 表格也按 filter 走
     if history_df is not None and not history_df.empty and "Timestamp" in history_df.columns:
         history_display = format_df(
             history_df.sort_values(by="Timestamp", ascending=False),
@@ -1288,6 +1422,5 @@ if show_ibkr_line or show_tiger_line or show_moomoo_line:
             cols_3dp=["UsdToSgd"],
         )
         st.dataframe(history_display, use_container_width=True, hide_index=True)
-
 else:
     st.info("暂无历史记录")

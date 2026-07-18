@@ -139,12 +139,12 @@ UNIFIED_POSITIONS_COLS = [
 UNIFIED_TRADES_COLS = [
     "Platform", "TradeDate", "Symbol", "Description", "AssetClass",
     "Buy/Sell", "Quantity", "TradePrice", "Currency",
-    "Strategy", "Notes", "Breakeven",
+    "Strategy", "Group", "Notes", "Breakeven",
     "NetCash", "Commission",
     "RealizedPnL", "RealizedPnLSgd", "UsdToSgd",
 ]
 
-JOURNAL_COLS = ["Strategy", "Notes", "Breakeven"] 
+JOURNAL_COLS = ["Strategy", "Group", "Notes", "Breakeven"] 
 
 # ⭐ Withdrawals stored as NEGATIVE (e.g. -500). Net Capital = Deposits + Withdrawals.
 # ⭐ Other = misc cashflow not categorized as Deposit/Withdrawal/Dividend/Tax/Fee

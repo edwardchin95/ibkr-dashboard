@@ -281,80 +281,6 @@ option_categories = analysis["option_categories"]
 option_positions = analysis["option_positions"]
 fx_ratio = analysis["fx_ratio"]
 
-# ============================================================
-# 🚨 OPTIONS 到期警报
-# ============================================================
-if df_positions is not None and len(option_positions) > 0:
-
-    expiring_7d = []
-    expiring_14d = []
-    expiring_30d = []
-
-    for op in option_positions:
-        dte = op.get("DTE")
-        if dte is None:
-            continue
-        if dte < 0:
-            continue
-        if dte <= 7:
-            expiring_7d.append(op)
-        elif dte <= 14:
-            expiring_14d.append(op)
-        elif dte <= 30:
-            expiring_30d.append(op)
-
-    if expiring_7d or expiring_14d or expiring_30d:
-
-        st.markdown(
-            "<div class='section-title'>⚠️ Options 到期警报</div>",
-            unsafe_allow_html=True
-        )
-
-        def render_expiry_group(title, items, accent_color):
-            if not items:
-                return
-
-            rows_html = ""
-            for op in sorted(items, key=lambda x: x.get("DTE", 999)):
-                dte = op.get("DTE", "?")
-                category = op.get("Category", "Other")
-                underlying = op.get("Underlying", "")
-                strike = op.get("Strike", "")
-                qty = op.get("Quantity", 0)
-
-                try:
-                    strike_str = f"${float(strike):,.0f}"
-                except:
-                    strike_str = str(strike)
-
-                rows_html += (
-                    f"<div style='display:flex; justify-content:space-between; padding:10px 0; "
-                    f"border-bottom:1px solid #2A2A2A; flex-wrap:wrap; gap:8px;'>"
-                    f"<div>"
-                    f"<span style='color:white; font-weight:bold;'>{underlying}</span>"
-                    f"<span style='color:gray; margin-left:8px;'>{category} {strike_str}</span>"
-                    f"</div>"
-                    f"<div style='text-align:right;'>"
-                    f"<span style='color:{accent_color}; font-weight:bold;'>{dte}d</span>"
-                    f"<span style='color:gray; margin-left:8px;'>x{int(abs(qty))}</span>"
-                    f"</div>"
-                    f"</div>"
-                )
-
-            card_html = (
-                f"<div class='card' style='padding:20px; border-left:4px solid {accent_color};'>"
-                f"<div style='color:{accent_color}; font-weight:bold; margin-bottom:12px; font-size:16px;'>"
-                f"{title} ({len(items)})"
-                f"</div>"
-                f"{rows_html}"
-                f"</div>"
-            )
-
-            st.markdown(card_html, unsafe_allow_html=True)
-
-        render_expiry_group("🔴 7 天内到期", expiring_7d, "#FF6666")
-        render_expiry_group("🟡 8-14 天到期", expiring_14d, "#FFC300")
-        render_expiry_group("🟢 15-30 天到期", expiring_30d, "#00D4AA")
 
 if df_positions is not None and not df_positions.empty:
 
@@ -609,12 +535,12 @@ if df_positions is not None and not df_positions.empty:
         editor_df = filtered.copy()
 
         # ✅ 确保 journal columns
-        for col in ["Strategy", "Notes", "Breakeven"]:
+        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
             if col not in editor_df.columns:
                 editor_df[col] = ""
 
         # ✅ 清洗
-        for col in ["Strategy", "Notes", "Breakeven"]:
+        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
             editor_df[col] = (
                 editor_df[col]
                 .fillna("")
@@ -629,7 +555,7 @@ if df_positions is not None and not df_positions.empty:
             hide_index=True,
             disabled=[
                 c for c in editor_df.columns
-                if c not in ["Strategy", "Notes", "Breakeven"]
+                if c not in ["Strategy", "Group", "Notes", "Breakeven"]
             ],
             key=editor_key,
 
@@ -645,6 +571,7 @@ if df_positions is not None and not df_positions.empty:
 
                 # ✅ 不设 fixed width → 接近 autofit
                 "Strategy": st.column_config.TextColumn("Strategy"),
+                "Group": st.column_config.TextColumn("Group"),
                 "Notes": st.column_config.TextColumn("Notes"),
                 "Breakeven": st.column_config.TextColumn("Breakeven")
             }
@@ -716,7 +643,7 @@ if df_positions is not None and not df_positions.empty:
                                         ] = value
 
                         # ✅ 清洗 Strategy / Notes / Breakeven
-                        for col in ["Strategy", "Notes", "Breakeven"]:
+                        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
                             if col not in edited_df.columns:
                                 edited_df[col] = ""
 
@@ -729,7 +656,7 @@ if df_positions is not None and not df_positions.empty:
                             )
 
                         # ✅ 确保 full_df 有 columns
-                        for col in ["Strategy", "Notes", "Breakeven"]:
+                        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
                             if col not in full_df.columns:
                                 full_df[col] = ""
 
@@ -778,7 +705,7 @@ if df_positions is not None and not df_positions.empty:
                             suffixes=("", "_new")
                         )
 
-                        for col in ["Strategy", "Notes", "Breakeven"]:
+                        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
                             new_col = f"{col}_new"
                             if new_col in full_df.columns:
                                 full_df[col] = full_df[new_col].combine_first(full_df[col])
