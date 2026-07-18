@@ -550,31 +550,50 @@ if len(all_option_positions) > 0:
                 except:
                     strike_str = str(strike)
 
+                try:
+                    dte_str = f"{int(dte)}d"
+                except:
+                    dte_str = f"{dte}d"
+
                 badge = PLATFORM_BADGE.get(plat, {"bg": "#666", "fg": "#fff"})
                 badge_html = (
                     f"<span style='background:{badge['bg']}; color:{badge['fg']}; "
-                    f"padding:2px 8px; border-radius:6px; font-size:11px; "
+                    f"padding:4px 10px; border-radius:6px; font-size:13px; "
                     f"font-weight:bold; margin-right:10px;'>{plat}</span>"
                 )
 
                 rows_html += (
-                    f"<div style='display:flex; justify-content:space-between; padding:10px 0; "
-                    f"border-bottom:1px solid #2A2A2A; flex-wrap:wrap; gap:8px;'>"
+                    f"<div style='display:flex; justify-content:space-between; "
+                    f"align-items:center; padding:14px 0; "
+                    f"border-bottom:1px solid #2A2A2A; flex-wrap:wrap; gap:10px;'>"
+
                     f"<div>"
                     f"{badge_html}"
-                    f"<span style='color:white; font-weight:bold;'>{underlying}</span>"
-                    f"<span style='color:gray; margin-left:8px;'>{category} {strike_str}</span>"
+                    f"<span style='color:white; font-weight:bold; font-size:17px;'>"
+                    f"{underlying}"
+                    f"</span>"
+                    f"<span style='color:#BBB; margin-left:10px; font-size:15px;'>"
+                    f"{category} {strike_str}"
+                    f"</span>"
                     f"</div>"
+
                     f"<div style='text-align:right;'>"
-                    f"<span style='color:{accent_color}; font-weight:bold;'>{dte}d</span>"
-                    f"<span style='color:gray; margin-left:8px;'>x{int(abs(qty))}</span>"
+                    f"<span style='color:{accent_color}; font-weight:bold; font-size:18px;'>"
+                    f"{dte_str}"
+                    f"</span>"
+                    f"<span style='color:#AAA; margin-left:10px; font-size:14px;'>"
+                    f"x{int(abs(qty))}"
+                    f"</span>"
                     f"</div>"
+
                     f"</div>"
                 )
 
             card_html = (
-                f"<div class='card' style='padding:20px; border-left:4px solid {accent_color};'>"
-                f"<div style='color:{accent_color}; font-weight:bold; margin-bottom:12px; font-size:16px;'>"
+                f"<div class='card' style='padding:22px; "
+                f"border-left:5px solid {accent_color};'>"
+                f"<div style='color:{accent_color}; font-weight:bold; "
+                f"margin-bottom:14px; font-size:19px;'>"
                 f"{title} ({len(items)})"
                 f"</div>"
                 f"{rows_html}"
@@ -757,7 +776,7 @@ if danger or warning:
             badge = PLATFORM_BADGE.get(plat, {"bg": "#666", "fg": "#fff"})
             badge_html = (
                 f"<span style='background:{badge['bg']}; color:{badge['fg']}; "
-                f"padding:2px 8px; border-radius:6px; font-size:11px; "
+                f"padding:4px 10px; border-radius:6px; font-size:13px; "
                 f"font-weight:bold; margin-right:10px;'>{plat}</span>"
             )
 
@@ -775,26 +794,31 @@ if danger or warning:
 
             rows_html += (
                 f"<div style='display:flex; justify-content:space-between; "
-                f"padding:10px 0; border-bottom:1px solid #2A2A2A; "
-                f"flex-wrap:wrap; gap:8px;'>"
+                f"align-items:center; padding:14px 0; "
+                f"border-bottom:1px solid #2A2A2A; flex-wrap:wrap; gap:10px;'>"
 
-                f"<div>"
+                f"<div style='min-width:220px;'>"
                 f"{badge_html}"
-                f"<span style='color:white; font-weight:bold;'>{r['Underlying']}</span>"
-                f"<span style='color:gray; margin-left:8px;'>"
+                f"<span style='color:white; font-weight:bold; font-size:17px;'>"
+                f"{r['Underlying']}"
+                f"</span>"
+                f"<span style='color:#BBB; margin-left:10px; font-size:15px;'>"
                 f"{r['Category']} {strike_str}"
                 f"</span>"
-                f"<div style='color:#888; font-size:11px; margin-top:4px;'>"
-                f"Group: {group_str} · BE ${r['Breakeven']:,.2f} · "
-                f"Current ${r['Current']:,.2f}"
+                f"<div style='color:#AAA; font-size:13px; margin-top:6px; "
+                f"line-height:1.5;'>"
+                f"Group: <span style='color:#DDD;'>{group_str}</span> · "
+                f"BE <span style='color:#DDD;'>${r['Breakeven']:,.2f}</span> · "
+                f"Now <span style='color:#DDD;'>${r['Current']:,.2f}</span>"
                 f"</div>"
                 f"</div>"
 
                 f"<div style='text-align:right;'>"
-                f"<span style='color:{accent_color}; font-weight:bold; font-size:16px;'>"
+                f"<span style='color:{accent_color}; font-weight:bold; "
+                f"font-size:22px;'>"
                 f"{r['Buffer']:+.1f}%"
                 f"</span>"
-                f"<div style='color:gray; font-size:11px; margin-top:4px;'>"
+                f"<div style='color:#AAA; font-size:13px; margin-top:6px;'>"
                 f"{dte_str} · x{int(abs(r['Quantity']))}"
                 f"</div>"
                 f"</div>"
@@ -803,10 +827,10 @@ if danger or warning:
             )
 
         card_html = (
-            f"<div class='card' style='padding:20px; "
-            f"border-left:4px solid {accent_color};'>"
+            f"<div class='card' style='padding:22px; "
+            f"border-left:5px solid {accent_color};'>"
             f"<div style='color:{accent_color}; font-weight:bold; "
-            f"margin-bottom:12px; font-size:16px;'>"
+            f"margin-bottom:14px; font-size:19px;'>"
             f"{title} ({len(items)})"
             f"</div>"
             f"{rows_html}"

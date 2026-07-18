@@ -694,7 +694,7 @@ if df_positions is not None and not df_positions.empty:
 
                         # ✅ merge overwrite（不依赖 changed rows）
                         updates = edited_df[
-                            ["_TradeKey", "Strategy", "Notes", "Breakeven"]
+                            ["_TradeKey", "Group","Strategy", "Notes", "Breakeven"]
                         ].copy()
                         updates = updates.drop_duplicates(subset=["_TradeKey"], keep="last")
 
