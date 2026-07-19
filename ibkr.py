@@ -549,7 +549,7 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
 
     # Save trades
     uploaded_file.seek(0)
-    save_trades_history(uploaded_file, fx_ratio=fx_ratio)
+    save_trades_history(uploaded_file, fx_ratio=fx_ratio, snapshot_file=snapshot_filename)
 
     return history_df
 
@@ -669,9 +669,6 @@ def process_incoming():
             fake_upload.seek(0)
             fx_ratio = _compute_fx_ratio(fake_upload)
 
-            fake_upload.seek(0)
-            save_trades_history(fake_upload, fx_ratio=fx_ratio)
-
         dividends = cash_summary.get("dividends", 0)
         withholding_tax = cash_summary.get("withholding_tax", 0)
         fees = cash_summary.get("fees", 0)
@@ -694,6 +691,14 @@ def process_incoming():
         else:
             new_name = f
             timestamp = f.replace("ibkr_flex_", "").replace(".csv", "")
+
+        # ⭐ Save trades AFTER new_name is defined
+        fake_upload.seek(0)
+        save_trades_history(
+            fake_upload,
+            fx_ratio=fx_ratio,
+            snapshot_file=new_name
+        )
 
         new_row = pd.DataFrame([{
             "Platform": "IBKR",
@@ -729,7 +734,6 @@ def process_incoming():
     history_df = _recompute_cumulative(history_df, "IBKR")
 
     history_df.to_csv(HISTORY_FILE, index=False)
-
 
 # ============================================================
 # ANALYZE POSITIONS (uses PositionValueSgd directly)
@@ -855,7 +859,7 @@ def analyze_positions(df_positions, total_nav_sgd, cash_sgd):
 # TRADES PARSER (Unified Schema)
 # ============================================================
 
-def parse_trades(file_obj, fx_ratio=None):
+def parse_trades(file_obj, fx_ratio=None, snapshot_file=""):
     if fx_ratio is None:
         file_obj.seek(0)
         fx_ratio = _compute_fx_ratio(file_obj)
@@ -927,6 +931,7 @@ def parse_trades(file_obj, fx_ratio=None):
         trades.append({
             "Platform": "IBKR",
             "TradeDate": trade_date,
+            "SnapshotFile": snapshot_file,
             "Symbol": symbol,
             "Description": description,
             "AssetClass": asset_class,
@@ -954,13 +959,13 @@ def parse_trades(file_obj, fx_ratio=None):
     return result[UNIFIED_TRADES_COLS]
 
 
-def save_trades_history(file_obj, fx_ratio=None):
+def save_trades_history(file_obj, fx_ratio=None, snapshot_file=""):
     file_obj.seek(0)
     if fx_ratio is None:
         fx_ratio = _compute_fx_ratio(file_obj)
         file_obj.seek(0)
 
-    new_trades = parse_trades(file_obj, fx_ratio=fx_ratio)
+    new_trades = parse_trades(file_obj, fx_ratio=fx_ratio, snapshot_file=snapshot_file)
 
     if new_trades.empty:
         return load_trades_history()

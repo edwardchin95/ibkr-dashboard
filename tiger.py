@@ -619,7 +619,7 @@ def _build_idx_map(header):
     }
 
 
-def parse_trades(file_obj, usd_to_sgd=None):
+def parse_trades(file_obj, usd_to_sgd=None, snapshot_file=""):
     rows = _read_rows(file_obj)
     fx_rates = extract_fx_rates(file_obj)
 
@@ -696,6 +696,7 @@ def parse_trades(file_obj, usd_to_sgd=None):
         trades.append({
             "Platform": "Tiger",
             "TradeDate": trade_date,
+            "SnapshotFile": snapshot_file,
             "Symbol": symbol,
             "Description": description,
             "AssetClass": asset_class,
@@ -727,13 +728,13 @@ def parse_trades(file_obj, usd_to_sgd=None):
 # SAVE TRADES HISTORY
 # ============================================================
 
-def save_trades_history(file_obj, usd_to_sgd=None):
+def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
     file_obj.seek(0)
     if usd_to_sgd is None:
         usd_to_sgd = get_usd_to_sgd_rate(file_obj)
         file_obj.seek(0)
 
-    new_trades = parse_trades(file_obj, usd_to_sgd=usd_to_sgd)
+    new_trades = parse_trades(file_obj, usd_to_sgd=usd_to_sgd, snapshot_file=snapshot_file)
 
     if new_trades.empty:
         return load_trades_history()
@@ -1017,7 +1018,7 @@ def save_snapshot_and_history(uploaded_file, *_args):
     history_df.to_csv(HISTORY_FILE, index=False)
 
     uploaded_file.seek(0)
-    save_trades_history(uploaded_file, usd_to_sgd=usd_to_sgd)
+    save_trades_history(uploaded_file, usd_to_sgd=usd_to_sgd, snapshot_file=snapshot_filename)
 
     return history_df
 
@@ -1145,9 +1146,6 @@ def process_incoming():
             withdrawal_sgd = withdrawal_usd * usd_to_sgd
             period_other = 0
 
-            fake_upload.seek(0)
-            save_trades_history(fake_upload, usd_to_sgd=usd_to_sgd)
-
         dividends_usd = cash_summary.get("dividends", 0)
         withholding_tax_usd = cash_summary.get("withholding_tax", 0)
         fees_usd = cash_summary.get("fees", 0)
@@ -1165,6 +1163,14 @@ def process_incoming():
         else:
             new_name = f
             timestamp = f.replace("tiger_", "").replace(".csv", "")
+
+        # ⭐ Save trades AFTER new_name is defined
+        fake_upload.seek(0)
+        save_trades_history(
+            fake_upload,
+            usd_to_sgd=usd_to_sgd,
+            snapshot_file=new_name
+        )
 
         new_row = pd.DataFrame([{
             "Platform": "Tiger",

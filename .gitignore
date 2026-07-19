@@ -1,11 +1,13 @@
 # Python
 __pycache__/
+__pycache__/*
 *.pyc
 *.pyo
 .venv/
 venv/
 env/
-
+app.cpython-313.pyc
+ibkr.cpython-313.pyc
 # Streamlit
 .streamlit/secrets.toml
 

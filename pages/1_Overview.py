@@ -1436,15 +1436,42 @@ if show_ibkr_line or show_tiger_line or show_moomoo_line:
     st.plotly_chart(fig_history, use_container_width=True)
 
     if history_df is not None and not history_df.empty and "Timestamp" in history_df.columns:
+
+        # ⭐ Essential columns for daily viewing
+        essential_cols = [
+            "Platform",
+            "Timestamp",
+            "SnapshotFile",
+            "NAV",
+            "Cash",
+            "PnL",
+            "PeriodDeposit",
+            "PeriodWithdrawal",
+        ]
+
+        # Filter to only columns that exist
+        essential_available = [c for c in essential_cols if c in history_df.columns]
+
+        history_sorted = history_df.sort_values(by="Timestamp", ascending=False)
+
+        # Main compact view
         history_display = format_df(
-            history_df.sort_values(by="Timestamp", ascending=False),
-            cols_2dp=["NAV", "Cash", "PnL",
-                    "TotalDeposit", "PeriodDeposit",
-                    "TotalWithdrawal", "PeriodWithdrawal",
-                    "TotalOther", "PeriodOther",
-                    "Dividends", "WithholdingTax", "NetDividends", "Fees"],
-            cols_3dp=["UsdToSgd"],
+            history_sorted[essential_available],
+            cols_2dp=["NAV", "Cash", "PnL", "PeriodDeposit", "PeriodWithdrawal"],
         )
         st.dataframe(history_display, use_container_width=True, hide_index=True)
+
+        # Full detail hidden behind expander
+        with st.expander("📊 Show full details (cumulative totals, dividends, fees, FX)"):
+            history_full = format_df(
+                history_sorted,
+                cols_2dp=["NAV", "Cash", "PnL",
+                        "TotalDeposit", "PeriodDeposit",
+                        "TotalWithdrawal", "PeriodWithdrawal",
+                        "TotalOther", "PeriodOther",
+                        "Dividends", "WithholdingTax", "NetDividends", "Fees"],
+                cols_3dp=["UsdToSgd"],
+            )
+            st.dataframe(history_full, use_container_width=True, hide_index=True)
 else:
     st.info("暂无历史记录")

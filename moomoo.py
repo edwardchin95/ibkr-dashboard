@@ -550,7 +550,7 @@ def parse_moomoo_csv(file_obj):
 # TRADES PARSER (Unified Schema)
 # ============================================================
 
-def parse_trades(file_obj, usd_to_sgd=None, hkd_to_sgd=None):
+def parse_trades(file_obj, usd_to_sgd=None, hkd_to_sgd=None, snapshot_file=""):
     meta, _, _, trades_df, _ = _parse_statement(file_obj)
 
     if trades_df is None or trades_df.empty:
@@ -569,6 +569,10 @@ def parse_trades(file_obj, usd_to_sgd=None, hkd_to_sgd=None):
         if col not in df.columns:
             df[col] = ""
 
+    # ⭐ Stamp SnapshotFile on every new trade row
+    if snapshot_file:
+        df["SnapshotFile"] = snapshot_file
+
     for i, row in df.iterrows():
         cur = _safe_str(row.get("Currency", "USD")).upper()
         if cur == "USD" and (row.get("UsdToSgd", "") == "" or pd.isna(row.get("UsdToSgd", ""))):
@@ -582,8 +586,8 @@ def parse_trades(file_obj, usd_to_sgd=None, hkd_to_sgd=None):
 # SAVE TRADES HISTORY
 # ============================================================
 
-def save_trades_history(file_obj, usd_to_sgd=None, hkd_to_sgd=None):
-    new_trades = parse_trades(file_obj, usd_to_sgd=usd_to_sgd, hkd_to_sgd=hkd_to_sgd)
+def save_trades_history(file_obj, usd_to_sgd=None, hkd_to_sgd=None, snapshot_file=""):
+    new_trades = parse_trades(file_obj, usd_to_sgd=usd_to_sgd, hkd_to_sgd=hkd_to_sgd, snapshot_file=snapshot_file)
 
     if new_trades.empty:
         return load_trades_history()
@@ -769,6 +773,17 @@ def _recompute_cumulative(history_df, platform):
 
     df = history_df.copy()
 
+    # ⭐ Force all amount columns to float (handle old csv where they might be int)
+    amount_cols = [
+        "TotalDeposit", "PeriodDeposit",
+        "TotalWithdrawal", "PeriodWithdrawal",
+        "TotalOther", "PeriodOther",
+    ]
+    for col in amount_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
+
     mask = df["Platform"].astype(str) == platform
     if not mask.any():
         return df
@@ -796,18 +811,11 @@ def _recompute_cumulative(history_df, platform):
 
     sub = sub.drop(columns=["_sort_key"], errors="ignore")
 
-    # ⭐ Ensure columns are float dtype (avoid int64 conflict with old csv)
-    for col in ["TotalDeposit", "TotalWithdrawal", "TotalOther"]:
-        if col not in df.columns:
-            df[col] = 0.0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(float)
-
     for col in ["TotalDeposit", "TotalWithdrawal", "TotalOther"]:
         if col in sub.columns:
             df.loc[sub.index, col] = sub[col].astype(float)
 
     return df
-
 
 # ============================================================
 # SAVE SNAPSHOT + HISTORY
@@ -901,7 +909,7 @@ def save_snapshot_and_history(uploaded_file, *_args):
     history_df.to_csv(HISTORY_FILE, index=False)
 
     uploaded_file.seek(0)
-    save_trades_history(uploaded_file, usd_to_sgd=usd_to_sgd, hkd_to_sgd=hkd_to_sgd)
+    save_trades_history(uploaded_file, usd_to_sgd=usd_to_sgd, hkd_to_sgd=hkd_to_sgd, snapshot_file=snapshot_filename)
 
     return history_df
 
@@ -1080,9 +1088,6 @@ def process_incoming():
             withdrawal = cs["withdrawals"]
             other = cs["other"]
 
-            fake_upload.seek(0)
-            save_trades_history(fake_upload, usd_to_sgd=usd_to_sgd, hkd_to_sgd=hkd_to_sgd)
-
         def _ymd(d):
             if not d:
                 return ""
@@ -1098,6 +1103,15 @@ def process_incoming():
         else:
             new_name = f
             timestamp = f.replace("moomoo_statement_", "").replace(".csv", "")
+
+        # ⭐ Save trades AFTER new_name is defined
+        fake_upload.seek(0)
+        save_trades_history(
+            fake_upload,
+            usd_to_sgd=usd_to_sgd,
+            hkd_to_sgd=hkd_to_sgd,
+            snapshot_file=new_name
+        )
 
         new_row = pd.DataFrame([{
             "Platform": "Moomoo",

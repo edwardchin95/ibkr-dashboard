@@ -137,7 +137,7 @@ UNIFIED_POSITIONS_COLS = [
 ]
 
 UNIFIED_TRADES_COLS = [
-    "Platform", "TradeDate", "Symbol", "Description", "AssetClass",
+    "Platform", "TradeDate", "SnapshotFile", "Symbol", "Description", "AssetClass",
     "Buy/Sell", "Quantity", "TradePrice", "Currency",
     "Strategy", "Group", "Notes", "Breakeven",
     "NetCash", "Commission",
@@ -515,13 +515,23 @@ def detect_coverage_gaps(platform):
     result["ranges"] = [(s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d")) for s, e in ranges]
 
     # Overlaps
+    # ⭐ Ignore boundary-day overlaps (weekly statements naturally share endpoints).
+    # Only flag when overlap spans >= 2 days.
     for i in range(1, len(ranges)):
         prev_s, prev_e = ranges[i - 1]
         cur_s, cur_e = ranges[i]
+
         if cur_s <= prev_e:
-            result["overlaps"].append(
-                (cur_s.strftime("%Y-%m-%d"), min(prev_e, cur_e).strftime("%Y-%m-%d"))
-            )
+            overlap_start = cur_s
+            overlap_end = min(prev_e, cur_e)
+            overlap_days = (overlap_end - overlap_start).days + 1
+
+            # Skip single-day boundary overlaps (e.g. A ends 6/26, B starts 6/26)
+            if overlap_days >= 2:
+                result["overlaps"].append(
+                    (overlap_start.strftime("%Y-%m-%d"),
+                     overlap_end.strftime("%Y-%m-%d"))
+                )
 
     # Merge ranges
     merged = []
