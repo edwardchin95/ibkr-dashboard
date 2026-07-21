@@ -117,6 +117,14 @@ def _join_tags(tags_list):
     return ",".join(result)
 
 
+def _parse_groups(group_str):
+    """Group column can be comma-separated for multi-campaign trades."""
+    s = _clean_str(group_str)
+    if not s:
+        return []
+    return [g.strip() for g in s.split(",") if g.strip()]
+
+
 def _safe_html(text):
     if text is None:
         return ""
@@ -134,12 +142,6 @@ def _safe_html(text):
 # ============================================================
 
 def _format_trade_label(row):
-    """
-    Get best display label for a trade row.
-    - Options (Tiger): extract "(SOFI 20260821 CALL 23.0)" from description
-    - Options (IBKR): use description like "AAOX 21JUL26 42 P"
-    - Stocks: use description or symbol
-    """
     asset_class = _clean_str(row.get("AssetClass", "")).upper()
     desc = _clean_str(row.get("Description", ""))
     sym = _clean_str(row.get("Symbol", ""))
@@ -160,12 +162,6 @@ def _format_trade_label(row):
 
 
 def _extract_underlying(row):
-    """
-    Get underlying symbol for tag generation.
-    - IBKR:   "AAOX 260717P00042000"       (space-separated)
-    - Moomoo: "MARA260724C17500"           (glued)
-    - Tiger:  Uses UnderlyingSymbol column
-    """
     us = _clean_str(row.get("UnderlyingSymbol", ""))
     if us:
         return us
@@ -177,12 +173,10 @@ def _extract_underlying(row):
         if " " in sym:
             return sym.split()[0]
 
-        # Moomoo style: SYMBOL(letters) + YYMMDD + C/P + STRIKE
         m = re.match(r'^([A-Z]+)\d{6}[CP]\d+$', sym.upper())
         if m:
             return m.group(1)
 
-        # Fallback: letters before first digit
         m = re.match(r'^([A-Z]+)', sym.upper())
         if m:
             return m.group(1)
@@ -191,16 +185,18 @@ def _extract_underlying(row):
 
 
 def _trade_row_to_tags(row):
-    """Clean tag list — underlying + group + platform only. No option code, no strategy."""
+    """Clean tag list — underlying + all groups + platform."""
     tags = []
 
     underlying = _extract_underlying(row)
     if underlying:
         tags.append(underlying)
 
-    group = _clean_str(row.get("Group", ""))
-    if group and group not in tags:
-        tags.append(group)
+    for g in _parse_groups(row.get("Group", "")):
+        if g == "_ignore":
+            continue  # Don't propagate _ignore as a journal tag
+        if g not in tags:
+            tags.append(g)
 
     platform = _clean_str(row.get("Platform", ""))
     if platform and platform not in tags:
@@ -214,7 +210,6 @@ def _trade_row_to_strategy(row):
 
 
 def _trade_row_to_notes_prefill(row):
-    """Build starter note with option identifier + numbers."""
     side = _clean_str(row.get("Buy/Sell", ""))
     label = _format_trade_label(row)
     qty = _clean_str(row.get("Quantity", ""))
@@ -255,6 +250,7 @@ def _load_journal(mtime):
         return pd.DataFrame(columns=JOURNAL_SCHEMA)
     if df.empty:
         return pd.DataFrame(columns=JOURNAL_SCHEMA)
+
     for col in JOURNAL_SCHEMA:
         if col not in df.columns:
             df[col] = ""
@@ -309,18 +305,25 @@ ALL_TAGS = _get_all_tags(journal_df)
 
 
 def _get_all_campaign_groups(journal_df, trades_df):
+    """Discover campaigns from trade Groups + journal tags. Excludes _ignore."""
     groups = set()
+
     if not trades_df.empty and "Group" in trades_df.columns:
-        for g in trades_df["Group"].dropna().unique():
-            gc = _clean_str(g)
-            if gc:
-                groups.add(gc)
+        for g_str in trades_df["Group"].dropna():
+            for g in _parse_groups(g_str):
+                if g == "_ignore":
+                    continue
+                groups.add(g)
+
     for tag_str in journal_df["Tags"].dropna():
         for t in _parse_tags(tag_str):
             if t in groups:
                 continue
+            if t == "_ignore":
+                continue
             if "-" in t and any(c.isdigit() for c in t):
                 groups.add(t)
+
     return sorted(groups)
 
 
@@ -330,7 +333,10 @@ def _get_all_campaign_groups(journal_df, trades_df):
 
 def _compute_campaign(group_name, trades_df, journal_df):
     if not trades_df.empty and "Group" in trades_df.columns:
-        gt = trades_df[trades_df["Group"] == group_name].copy()
+        mask = trades_df["Group"].fillna("").apply(
+            lambda g: group_name in _parse_groups(g)
+        )
+        gt = trades_df[mask].copy()
     else:
         gt = pd.DataFrame()
 
@@ -373,19 +379,28 @@ def _compute_campaign(group_name, trades_df, journal_df):
             if sc:
                 strategy_tags.add(sc)
 
+    # Journal notes matching this campaign
+    campaign_notes_mask = journal_df["Tags"].apply(
+        lambda t: group_name in _parse_tags(t) if pd.notna(t) else False
+    )
+    campaign_notes_df = journal_df[campaign_notes_mask]
+
+    for _, note in campaign_notes_df.iterrows():
+        for tag in _parse_tags(note.get("Tags", "")):
+            if tag in ("SP", "CC", "PMCC", "LEAPS", "Roll Out and Down", "Roll", "CSP", "Synthetic"):
+                strategy_tags.add(tag)
+
     matching_notes = []
     latest_be = ""
 
-    for _, r in journal_df.iterrows():
-        tags = _parse_tags(r.get("Tags", ""))
-        if group_name in tags:
-            matching_notes.append({
-                "date": _normalize_date(r.get("Date", "")),
-                "tags": tags,
-                "notes": _clean_str(r.get("Notes", "")),
-                "breakeven": _clean_str(r.get("Breakeven", "")),
-                "journal_id": _clean_str(r.get("JournalId", "")),
-            })
+    for _, r in campaign_notes_df.iterrows():
+        matching_notes.append({
+            "date": _normalize_date(r.get("Date", "")),
+            "tags": _parse_tags(r.get("Tags", "")),
+            "notes": _clean_str(r.get("Notes", "")),
+            "breakeven": _clean_str(r.get("Breakeven", "")),
+            "journal_id": _clean_str(r.get("JournalId", "")),
+        })
 
     matching_notes.sort(key=lambda x: x["date"], reverse=True)
     for note in matching_notes:
@@ -419,8 +434,23 @@ def _compute_campaign(group_name, trades_df, journal_df):
 
     timeline.sort(key=lambda x: x["date"] or "0000-00-00")
 
-    all_dates = [t["date"] for t in timeline if t["date"]]
-    start_date = min(all_dates) if all_dates else ""
+    # ⭐ Days Running — based on earliest journal date (campaign conception),
+    # fallback to earliest trade date if no journal entries
+    journal_dates = [note["date"] for note in matching_notes if note["date"]]
+    trade_dates = [
+        _normalize_date(r.get("TradeDate", ""))
+        for _, r in gt.iterrows()
+    ] if not gt.empty else []
+    trade_dates = [d for d in trade_dates if d]
+
+    if journal_dates:
+        start_date = min(journal_dates)
+    elif trade_dates:
+        start_date = min(trade_dates)
+    else:
+        start_date = ""
+
+    all_dates = journal_dates + trade_dates
     end_date = max(all_dates) if all_dates else ""
 
     days_running = 0
@@ -656,7 +686,9 @@ def _filter_trades(df, symbol="", platform="All", group="All", days=90):
         result = result[result["Platform"] == platform]
 
     if group != "All" and "Group" in result.columns:
-        result = result[result["Group"] == group]
+        result = result[
+            result["Group"].fillna("").apply(lambda g: group in _parse_groups(g))
+        ]
 
     if days > 0 and "TradeDate" in result.columns:
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -691,7 +723,6 @@ def _add_entry_dialog():
         st.session_state["dialog_notes"] = default_notes
         st.session_state["dialog_be"] = ""
 
-        # Persist prefill status across reruns
         st.session_state["_dialog_prefill_summary"] = prefill.get("summary", "")
 
     prefill_summary = st.session_state.get("_dialog_prefill_summary", "")
@@ -704,53 +735,20 @@ def _add_entry_dialog():
         key="dialog_date",
     )
 
-    # ============================================================
-    # Reference trades — filter + combine button + scrollable list
-    # ============================================================
     with st.expander("📊 Reference trades (optional)", expanded=False):
 
-        # Row 1: filter input + combine button
         filter_col, action_col = st.columns([3, 2])
 
         with filter_col:
-            # ⭐ Build symbol dropdown from existing trades (reactive)
-            if not trades_df.empty and "Symbol" in trades_df.columns:
-                # Get unique underlyings from trade rows
-                symbols_set = set()
-                for _, tr in trades_df.iterrows():
-                    u = _extract_underlying(tr)
-                    if u:
-                        symbols_set.add(u)
-                symbols_list = sorted(symbols_set)
-            else:
-                symbols_list = []
-
-            options = ["— All / Type below —"] + symbols_list
-
-            selected_symbol = st.selectbox(
+            symbol_filter = st.text_input(
                 "Filter by symbol",
-                options=options,
-                key="ref_symbol_select",
-                label_visibility="collapsed",
-            )
-
-            # Fallback text input for custom filter
-            manual_filter = st.text_input(
-                "Or type symbol",
                 key="ref_symbol_filter",
-                placeholder="Type custom symbol...",
+                placeholder="e.g. SOFI",
                 label_visibility="collapsed",
             )
-
-            # Use dropdown if picked, else manual
-            if selected_symbol and selected_symbol != "— All / Type below —":
-                symbol_filter = selected_symbol
-            else:
-                symbol_filter = manual_filter
 
         matching = _filter_trades(trades_df, symbol=symbol_filter, days=365)
 
-        # Count currently-checked trades (before rendering the list)
         selected_count = 0
         for k, v in st.session_state.items():
             if k.startswith("trade_check_") and v is True:
@@ -770,14 +768,12 @@ def _add_entry_dialog():
                             selected_trades_data.append(r)
 
                     if len(selected_trades_data) >= 2:
-                        # Merge tags
                         all_tags = []
                         for tr in selected_trades_data:
                             for t in _parse_tags(_trade_row_to_tags(tr)):
                                 if t not in all_tags:
                                     all_tags.append(t)
 
-                        # Strategy — most common
                         strategies = [_trade_row_to_strategy(tr) for tr in selected_trades_data]
                         strategies = [s for s in strategies if s]
                         if strategies:
@@ -785,7 +781,6 @@ def _add_entry_dialog():
                         else:
                             combined_strategy = ""
 
-                        # Date — most recent
                         dates = [
                             _normalize_date(_clean_str(tr.get("TradeDate", "")))
                             for tr in selected_trades_data
@@ -793,7 +788,6 @@ def _add_entry_dialog():
                         dates = [d for d in dates if d]
                         combined_date = max(dates) if dates else date.today().strftime("%Y-%m-%d")
 
-                        # Notes — one line per trade + net summary
                         notes_lines = []
                         net_total = 0.0
                         for tr in selected_trades_data:
@@ -805,7 +799,6 @@ def _add_entry_dialog():
                         notes_lines.append(f"Net: {'+' if net_total >= 0 else ''}${net_total:,.2f}")
                         combined_notes = "\n".join(notes_lines)
 
-                        # Summary
                         summary_parts = []
                         for tr in selected_trades_data[:2]:
                             s = _clean_str(tr.get("Buy/Sell", ""))
@@ -823,7 +816,6 @@ def _add_entry_dialog():
                             "summary": combined_summary,
                         }
 
-                        # Clear checkboxes
                         for k in list(st.session_state.keys()):
                             if k.startswith("trade_check_"):
                                 st.session_state.pop(k, None)
@@ -833,7 +825,6 @@ def _add_entry_dialog():
             else:
                 st.caption(f"{selected_count} selected" if selected_count else "Select 2+ to combine")
 
-        # Results count
         if matching.empty:
             if symbol_filter.strip():
                 st.caption(f"No matches for '{symbol_filter}'.")
@@ -842,7 +833,6 @@ def _add_entry_dialog():
         else:
             st.caption(f"Showing {min(len(matching), 10)} of {len(matching)} matches")
 
-            # Scrollable container start
             st.markdown(
                 "<div style='max-height:400px; overflow-y:auto; padding-right:8px;'>",
                 unsafe_allow_html=True,
@@ -879,6 +869,17 @@ def _add_entry_dialog():
                         )
 
                     with info_col:
+                        current_groups = _parse_groups(r.get("Group", ""))
+                        group_html = ""
+                        if current_groups:
+                            group_badges = " ".join([
+                                f"<span style='background:rgba(255,195,0,0.15); color:#B45309; "
+                                f"padding:1px 6px; border-radius:3px; font-size:10px; font-weight:600;'>"
+                                f"{_safe_html(g)}</span>"
+                                for g in current_groups
+                            ])
+                            group_html = f"<div style='margin-top:3px;'>{group_badges}</div>"
+
                         st.markdown(
                             f"<div style='font-size:11px; color:#888;'>"
                             f"{trade_date} · {platform}"
@@ -890,7 +891,8 @@ def _add_entry_dialog():
                             f"<div style='font-size:11px; color:#666; margin-top:2px;'>"
                             f"qty {_safe_html(qty)} @ {_safe_html(price)}"
                             f" · <span style='color:{net_color}; font-weight:600;'>{net_display}</span>"
-                            f"</div>",
+                            f"</div>"
+                            f"{group_html}",
                             unsafe_allow_html=True,
                         )
 
@@ -909,12 +911,8 @@ def _add_entry_dialog():
                             st.session_state["_reopen_add_dialog"] = True
                             st.rerun()
 
-            # Scrollable container end
             st.markdown("</div>", unsafe_allow_html=True)
 
-    # ============================================================
-    # Tags, Strategy, Notes, BE
-    # ============================================================
     st.markdown("**Tags** (comma-separated)")
 
     if ALL_TAGS:
@@ -932,7 +930,7 @@ def _add_entry_dialog():
         "Strategy",
         value=default_strategy,
         placeholder="e.g. SP, CC, PMCC, Roll Out and Down",
-        help="Added as a tag on save (auto-populated when copying from trade)",
+        help="Added as a tag on save",
         key="dialog_strategy",
     )
 
@@ -973,7 +971,6 @@ def _add_entry_dialog():
             if col not in existing.columns:
                 existing[col] = ""
 
-        # Merge Strategy field into Tags on save
         parsed_tags = _parse_tags(tags_input)
         strategy_clean = strategy_input.strip()
         if strategy_clean and strategy_clean not in parsed_tags:
@@ -993,7 +990,6 @@ def _add_entry_dialog():
         new_df = pd.concat([existing, pd.DataFrame([new_row])], ignore_index=True)
         _save_journal(new_df)
 
-        # Clean up widget state so next open starts fresh
         for k in ["dialog_date", "dialog_tags", "dialog_strategy", "dialog_notes", "dialog_be"]:
             st.session_state.pop(k, None)
         st.session_state.pop("_dialog_prefill_summary", None)
@@ -1044,7 +1040,7 @@ st.markdown(
 all_groups = _get_all_campaign_groups(journal_df, trades_df)
 
 if not all_groups:
-    st.info("No campaigns yet. Add a journal entry with a campaign tag (e.g. `AAOX-SP-1`) or upload broker CSV with Group column.")
+    st.info("No campaigns yet. Set a Group value on trades in the Assign section below, or add a journal entry with a campaign tag.")
 else:
     campaigns = [_compute_campaign(g, trades_df, journal_df) for g in all_groups]
 
@@ -1069,76 +1065,268 @@ st.markdown("---")
 
 
 # ============================================================
-# SECTION 2 — RECENT TRADES BROWSER
+# SECTION 2 — ASSIGN TRADES TO CAMPAIGNS
 # ============================================================
 
 st.markdown(
-    "<div class='section-title'>📊 Recent Trades</div>",
+    "<div class='section-title'>🔗 Assign Trades to Campaigns</div>",
     unsafe_allow_html=True
+)
+
+st.caption(
+    "Edit the Group column to assign trades to campaigns. "
+    "Use comma-separated values for multi-campaign trades (e.g. `SOFI-LEAPS-1,SOFI-PMCC-1`). "
+    "Use `_ignore` for accumulation trades you don't want to track."
 )
 
 if trades_df.empty:
     st.info("No trades in trades_history.csv")
 else:
-    with st.expander("Browse trades to reference", expanded=False):
-        b_c1, b_c2, b_c3, b_c4 = st.columns(4)
+    # ⭐ Count unassigned trades (blank Group, excludes _ignore)
+    unassigned_count = 0
+    if "Group" in trades_df.columns:
+        unassigned_count = int(
+            trades_df["Group"].fillna("").apply(
+                lambda g: _clean_str(g) == ""
+            ).sum()
+        )
 
-        with b_c1:
-            platforms_list = ["All"] + sorted(trades_df["Platform"].dropna().unique().tolist())
-            browse_platform = st.selectbox("Broker", platforms_list, key="browse_platform")
+    expander_label = "Edit trade Group assignments"
+    if unassigned_count > 0:
+        expander_label = f"⚠️ Edit trade Group assignments ({unassigned_count} unassigned)"
 
-        with b_c2:
-            browse_symbol = st.text_input("Symbol", key="browse_symbol", placeholder="e.g. AAOX")
+    with st.expander(expander_label, expanded=(unassigned_count > 0)):
+        assign_c1, assign_c2, assign_c3 = st.columns(3)
 
-        with b_c3:
-            if "Group" in trades_df.columns:
-                groups_list = ["All"] + sorted(
-                    [g for g in trades_df["Group"].dropna().unique().tolist() if _clean_str(g)]
-                )
-            else:
-                groups_list = ["All"]
-            browse_group = st.selectbox("Group", groups_list, key="browse_group")
+        with assign_c1:
+            assign_platforms = ["All"] + sorted(trades_df["Platform"].dropna().unique().tolist())
+            assign_platform = st.selectbox("Broker", assign_platforms, key="assign_platform")
 
-        with b_c4:
-            browse_days = st.selectbox(
+        with assign_c2:
+            assign_symbol = st.text_input("Symbol filter", key="assign_symbol", placeholder="e.g. SOFI")
+
+        with assign_c3:
+            assign_days = st.selectbox(
                 "Time range",
                 [30, 90, 180, 365, 9999],
                 format_func=lambda x: {30: "30 days", 90: "90 days", 180: "180 days", 365: "1 year", 9999: "All"}.get(x, str(x)),
                 index=2,
-                key="browse_days",
+                key="assign_days",
             )
 
-        browse_result = _filter_trades(
-            trades_df,
-            symbol=browse_symbol,
-            platform=browse_platform,
-            group=browse_group,
-            days=browse_days,
+        show_unassigned_only = st.checkbox(
+            "Show only trades with blank Group (excludes _ignore)",
+            key="assign_show_unassigned",
         )
 
-        st.caption(f"Showing {len(browse_result)} trade(s)")
+        assign_result = _filter_trades(
+            trades_df,
+            symbol=assign_symbol,
+            platform=assign_platform,
+            days=assign_days,
+        )
 
-        if browse_result.empty:
+        if show_unassigned_only and "Group" in assign_result.columns:
+            assign_result = assign_result[
+                assign_result["Group"].fillna("").apply(
+                    lambda g: _clean_str(g) == ""
+                )
+            ]
+
+        st.caption(f"Showing {len(assign_result)} trade(s)")
+
+        if assign_result.empty:
             st.info("No trades match filters.")
         else:
-            display_cols = [
+            assign_result = assign_result.copy()
+
+            assign_display_cols = [
                 c for c in [
-                    "TradeDate", "Platform", "Symbol", "Description", "AssetClass",
-                    "Buy/Sell", "Quantity", "TradePrice", "NetCash",
-                    "RealizedPnLSgd", "Strategy", "Group",
-                ] if c in browse_result.columns
+                    "TradeDate", "Platform", "Symbol", "Description",
+                    "AssetClass", "Buy/Sell", "Quantity", "TradePrice",
+                    "NetCash", "Group",
+                ] if c in assign_result.columns
             ]
-            st.dataframe(
-                browse_result[display_cols].head(200),
+
+            if "Group" not in assign_result.columns:
+                assign_result["Group"] = ""
+                assign_display_cols.append("Group")
+
+            editor_df_assign = assign_result[assign_display_cols].reset_index(drop=True)
+
+            for col in ["Group"]:
+                if col in editor_df_assign.columns:
+                    editor_df_assign[col] = editor_df_assign[col].fillna("").astype(str)
+                    editor_df_assign[col] = editor_df_assign[col].replace("nan", "").replace("None", "")
+
+            assign_editor_key = "assign_trades_editor"
+
+            edited_assign_df = st.data_editor(
+                editor_df_assign.head(100),
                 use_container_width=True,
                 hide_index=True,
+                disabled=[c for c in editor_df_assign.columns if c != "Group"],
+                key=assign_editor_key,
+                column_config={
+                    "Group": st.column_config.TextColumn(
+                        "Group",
+                        help="Comma-separated for multi-campaign. Use _ignore for accumulation trades.",
+                        width="medium",
+                    ),
+                }
             )
+
+            st.markdown("""
+            <style>
+            div[data-testid="stDataEditor"] table { width: 100% !important; }
+            div[data-testid="stDataEditor"] th,
+            div[data-testid="stDataEditor"] td {
+                white-space: normal !important;
+                max-width: none !important;
+            }
+            </style>
+            """, unsafe_allow_html=True)
+
+            # ⭐ Two-button row: Save | Bulk ignore
+            ignore_col, save_col = st.columns([1, 1])
+
+            if ignore_col.button(
+                "🚫 Mark visible blank rows as _ignore",
+                use_container_width=True,
+                type="secondary",
+                key="bulk_ignore",
+                help="Set Group to `_ignore` for all currently-visible rows that have blank Group",
+            ):
+                try:
+                    state = st.session_state.get(assign_editor_key, None)
+                    working_df = edited_assign_df.copy()
+
+                    if isinstance(state, dict) and "edited_rows" in state:
+                        for row_pos, changes in state.get("edited_rows", {}).items():
+                            try:
+                                row_pos = int(row_pos)
+                            except:
+                                continue
+                            for col, value in changes.items():
+                                if col in working_df.columns and row_pos < len(working_df):
+                                    working_df.iloc[
+                                        row_pos,
+                                        working_df.columns.get_loc(col)
+                                    ] = value
+
+                    full_trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+                    if "Group" not in full_trades.columns:
+                        full_trades["Group"] = ""
+
+                    key_cols = [
+                        "Platform", "TradeDate", "Symbol", "Buy/Sell",
+                        "Quantity", "TradePrice", "NetCash",
+                    ]
+
+                    def make_key(df):
+                        parts = df[key_cols].copy()
+                        for c in key_cols:
+                            parts[c] = parts[c].fillna("").astype(str).str.strip()
+                        return parts.agg("|".join, axis=1)
+
+                    full_trades["_TradeKey"] = make_key(full_trades)
+                    working_df["_TradeKey"] = make_key(working_df)
+
+                    # Rows in current view with blank Group
+                    blank_mask = working_df["Group"].fillna("").apply(
+                        lambda g: _clean_str(g) == ""
+                    )
+                    blank_keys = working_df[blank_mask]["_TradeKey"].tolist()
+
+                    if not blank_keys:
+                        st.warning("No visible rows with blank Group to mark.")
+                    else:
+                        mask = full_trades["_TradeKey"].isin(blank_keys)
+                        full_trades.loc[mask, "Group"] = "_ignore"
+                        full_trades = full_trades.drop(columns=["_TradeKey"], errors="ignore")
+                        full_trades.to_csv(TRADES_HISTORY_FILE, index=False)
+
+                        st.success(f"✅ Marked {len(blank_keys)} trades as `_ignore`.")
+                        st.cache_data.clear()
+                        st.rerun()
+
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+
+            if save_col.button(
+                "💾 Save Group Assignments",
+                use_container_width=True,
+                type="primary",
+                key="save_assignments",
+            ):
+                try:
+                    state = st.session_state.get(assign_editor_key, None)
+                    if isinstance(state, dict) and "edited_rows" in state:
+                        edited_assign_df = edited_assign_df.copy()
+                        for row_pos, changes in state.get("edited_rows", {}).items():
+                            try:
+                                row_pos = int(row_pos)
+                            except:
+                                continue
+                            for col, value in changes.items():
+                                if col in edited_assign_df.columns and row_pos < len(edited_assign_df):
+                                    edited_assign_df.iloc[
+                                        row_pos,
+                                        edited_assign_df.columns.get_loc(col)
+                                    ] = value
+
+                    full_trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+                    if "Group" not in full_trades.columns:
+                        full_trades["Group"] = ""
+
+                    key_cols = [
+                        "Platform", "TradeDate", "Symbol", "Buy/Sell",
+                        "Quantity", "TradePrice", "NetCash",
+                    ]
+
+                    def make_key(df):
+                        parts = df[key_cols].copy()
+                        for c in key_cols:
+                            parts[c] = parts[c].fillna("").astype(str).str.strip()
+                        return parts.agg("|".join, axis=1)
+
+                    full_trades["_TradeKey"] = make_key(full_trades)
+                    edited_assign_df["_TradeKey"] = make_key(edited_assign_df)
+
+                    # Normalize edited Group (dedupe entries within comma-separated)
+                    edited_assign_df["Group"] = edited_assign_df["Group"].apply(
+                        lambda g: ",".join(_parse_groups(g))
+                    )
+
+                    updates = edited_assign_df[["_TradeKey", "Group"]].copy()
+                    updates = updates.drop_duplicates(subset=["_TradeKey"], keep="last")
+
+                    full_trades = full_trades.merge(
+                        updates,
+                        on="_TradeKey",
+                        how="left",
+                        suffixes=("", "_new")
+                    )
+
+                    if "Group_new" in full_trades.columns:
+                        full_trades["Group"] = full_trades["Group_new"].combine_first(full_trades["Group"])
+                        full_trades.drop(columns=["Group_new"], inplace=True)
+
+                    full_trades = full_trades.drop(columns=["_TradeKey"], errors="ignore")
+                    full_trades.to_csv(TRADES_HISTORY_FILE, index=False)
+
+                    st.success("✅ Group assignments saved.")
+                    st.cache_data.clear()
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
 
 st.markdown("---")
 
 
 # ============================================================
-# SECTION 3 — ALL NOTES (editable table with inline delete)
+# SECTION 3 — ALL NOTES
 # ============================================================
 
 st.markdown(
@@ -1211,24 +1399,6 @@ else:
                 "JournalId": st.column_config.TextColumn("ID", disabled=True),
             }
         )
-
-        st.markdown("""
-        <style>
-        div[data-testid="stDataEditor"] table { width: 100% !important; }
-        div[data-testid="stDataEditor"] th,
-        div[data-testid="stDataEditor"] td {
-            white-space: normal !important;
-            max-width: none !important;
-        }
-        div[data-testid="stDataEditor"] textarea {
-            white-space: pre-wrap !important;
-            overflow-wrap: break-word !important;
-            word-break: break-word !important;
-            min-height: 60px !important;
-            line-height: 1.5;
-        }
-        </style>
-        """, unsafe_allow_html=True)
 
         col_save, col_delete = st.columns([1, 1])
 

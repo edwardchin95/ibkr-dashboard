@@ -413,10 +413,10 @@ if df_positions is not None and not df_positions.empty:
     st.dataframe(positions_display, use_container_width=True, hide_index=True)
 
     # ============================================================
-    # 📝 交易记录
+    # 📝 Recent Trades (read-only)
     # ============================================================
     st.markdown(
-        "<div class='section-title'>📝 交易记录</div>",
+        "<div class='section-title'>📝 Recent Trades</div>",
         unsafe_allow_html=True
     )
 
@@ -456,205 +456,27 @@ if df_positions is not None and not df_positions.empty:
         if sel_side != "All":
             filtered = filtered[filtered["Buy/Sell"] == sel_side]
 
-        # ================================
-        # ✅ Editable Trade Journal（单一表）
-        # ================================
+        display_cols = [
+            c for c in [
+                "TradeDate", "Symbol", "Description", "AssetClass",
+                "Buy/Sell", "Quantity", "TradePrice", "NetCash",
+                "RealizedPnLSgd", "Group",
+            ] if c in filtered.columns
+        ]
 
-        editor_key = "moomoo_trade_journal_editor"
-
-        editor_df = filtered.copy()
-
-        # ✅ 确保 journal columns
-        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
-            if col not in editor_df.columns:
-                editor_df[col] = ""
-
-        # ✅ 清洗
-        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
-            editor_df[col] = (
-                editor_df[col]
-                .fillna("")
-                .astype(str)
-                .replace("nan", "")
-                .replace("None", "")
-            )
-
-        edited_df = st.data_editor(
-            editor_df,
+        st.dataframe(
+            filtered[display_cols],
             use_container_width=True,
             hide_index=True,
-            disabled=[
-                c for c in editor_df.columns
-                if c not in ["Strategy", "Group", "Notes", "Breakeven"]
-            ],
-            key=editor_key,
-
-            # ✅ ✅ ✅ 数字格式（取代 format_df）
-            column_config={
-                "Quantity": st.column_config.NumberColumn(format="%.2f"),
-                "TradePrice": st.column_config.NumberColumn(format="%.2f"),
-                "NetCash": st.column_config.NumberColumn(format="%.2f"),
-                "Commission": st.column_config.NumberColumn(format="%.2f"),
-                "RealizedPnL": st.column_config.NumberColumn(format="%.2f"),
-                "RealizedPnLSgd": st.column_config.NumberColumn(format="%.2f"),
-                "UsdToSgd": st.column_config.NumberColumn(format="%.3f"),
-
-                # ✅ 不设 fixed width → 接近 autofit
-                "Strategy": st.column_config.TextColumn("Strategy"),
-                "Group": st.column_config.TextColumn("Group"),
-                "Notes": st.column_config.TextColumn("Notes"),
-                "Breakeven": st.column_config.TextColumn("Breakeven")
-            }
         )
 
-        # ✅ ✅ ✅ 模拟 autofit + Notes 自动换行（关键）
-        st.markdown("""
-        <style>
-
-        /* ✅ 表格撑满画面 */
-        div[data-testid="stDataEditor"] table {
-            width: 100% !important;
-        }
-
-        /* ✅ column 自动适应内容 */
-        div[data-testid="stDataEditor"] th,
-        div[data-testid="stDataEditor"] td {
-            white-space: normal !important;
-            max-width: none !important;
-        }
-
-        /* ✅ Notes 自动换行 + 自动变高 */
-        div[data-testid="stDataEditor"] textarea {
-            white-space: pre-wrap !important;
-            overflow-wrap: break-word !important;
-            word-break: break-word !important;
-            min-height: 80px !important;
-            line-height: 1.5;
-        }
-
-        </style>
-        """, unsafe_allow_html=True)
-
-
-        # ================================
-        # ✅ Save Button
-        # ================================
-
-        if st.button("💾 Save Trade Journal", use_container_width=True):
-
-            try:
-                if not os.path.exists(TRADES_HISTORY_FILE):
-                    st.warning("trades_history.csv not found")
-                else:
-                    full_df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
-
-                    if full_df.empty:
-                        st.warning("No trades to save")
-                    else:
-                        # =====================================================
-                        # ✅ Mobile fix（关键）
-                        # =====================================================
-                        state = st.session_state.get(editor_key, None)
-
-                        if isinstance(state, dict) and "edited_rows" in state:
-                            edited_df = edited_df.copy()
-
-                            for row_pos, changes in state.get("edited_rows", {}).items():
-                                try:
-                                    row_pos = int(row_pos)
-                                except:
-                                    continue
-
-                                for col, value in changes.items():
-                                    if col in edited_df.columns and row_pos < len(edited_df):
-                                        edited_df.iloc[
-                                            row_pos,
-                                            edited_df.columns.get_loc(col)
-                                        ] = value
-
-                        # ✅ 清洗 Strategy / Notes / Breakeven
-                        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
-                            if col not in edited_df.columns:
-                                edited_df[col] = ""
-
-                            edited_df[col] = (
-                                edited_df[col]
-                                .fillna("")
-                                .astype(str)
-                                .replace("nan", "")
-                                .replace("None", "")
-                            )
-
-                        # ✅ 确保 full_df 有 columns
-                        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
-                            if col not in full_df.columns:
-                                full_df[col] = ""
-
-                        # ✅ key columns
-                        key_cols = [
-                            "Platform",
-                            "TradeDate",
-                            "Symbol",
-                            "Buy/Sell",
-                            "Quantity",
-                            "TradePrice",
-                            "NetCash",
-                        ]
-
-                        for col in key_cols:
-                            if col not in full_df.columns:
-                                full_df[col] = ""
-                            if col not in edited_df.columns:
-                                edited_df[col] = ""
-
-                        # ✅ 构建 TradeKey
-                        def make_key(df):
-                            key = df[key_cols].copy()
-                            for c in key_cols:
-                                key[c] = (
-                                    key[c]
-                                    .fillna("")
-                                    .astype(str)
-                                    .str.strip()
-                                )
-                            return key.agg("|".join, axis=1)
-
-                        full_df["_TradeKey"] = make_key(full_df)
-                        edited_df["_TradeKey"] = make_key(edited_df)
-
-                        # ✅ merge overwrite（不依赖 changed rows）
-                        updates = edited_df[
-                            ["_TradeKey", "Group","Strategy", "Notes", "Breakeven"]
-                        ].copy()
-                        updates = updates.drop_duplicates(subset=["_TradeKey"], keep="last")
-
-                        full_df = full_df.merge(
-                            updates,
-                            on="_TradeKey",
-                            how="left",
-                            suffixes=("", "_new")
-                        )
-
-                        for col in ["Strategy", "Group", "Notes", "Breakeven"]:
-                            new_col = f"{col}_new"
-                            if new_col in full_df.columns:
-                                full_df[col] = full_df[new_col].combine_first(full_df[col])
-                                full_df.drop(columns=[new_col], inplace=True)
-
-                        full_df = full_df.drop(columns=["_TradeKey"], errors="ignore")
-
-                        full_df.to_csv(TRADES_HISTORY_FILE, index=False)
-
-                        st.success("✅ Trade journal saved")
-                        st.cache_data.clear()
-                        st.rerun()
-
-            except Exception as e:
-                st.error(f"Save failed: {e}")
-
+        st.page_link(
+            "pages/5_Trade_Journal.py",
+            label="📝 Journal & campaigns → Trade Journal page",
+        )
 
         # ============================================================
-        # 📈 Trading Performance（用 RealizedPnLSgd）
+        # 📈 Trading Performance (using RealizedPnLSgd)
         # ============================================================
 
         pnl_col = None
@@ -787,8 +609,7 @@ if df_positions is not None and not df_positions.empty:
                 st.info("暂无关仓交易记录，所以没有 Win Rate 统计。")
 
     else:
-        st.info("暂无交易记录。上传 CSV 后会自动累加。")
-
+        st.info("No trades yet.")
     # ============================================================
     # 💰 Dividends & Capital (3 + 4 布局)
     # ============================================================
