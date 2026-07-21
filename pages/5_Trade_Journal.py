@@ -2,7 +2,8 @@ import streamlit as st
 import pandas as pd
 import os
 import uuid
-from datetime import datetime, date
+import re
+from datetime import datetime, date, timedelta
 
 st.set_page_config(page_title="Trade Journal", page_icon="📝", layout="wide")
 
@@ -18,7 +19,6 @@ from app import (
 require_auth()
 load_css()
 
-# ⭐ Hide "app" from sidebar
 st.markdown("""
 <style>
 [data-testid="stSidebarNav"] ul li:first-child { display: none; }
@@ -77,44 +77,29 @@ def _clean_str(v, default=""):
 
 
 def _normalize_date(s):
-    """
-    Best-effort ISO YYYY-MM-DD normalization.
-    Handles: ISO, ISO with time, DD/M/YYYY, M/D/YYYY, trailing commas, whitespace,
-    and truncated dates like '2026-05-'.
-    """
     s = _clean_str(s)
     if not s:
         return ""
-
-    # Strip trailing junk: commas, semicolons, extra spaces
     s = s.rstrip(",.;: \t").strip()
-
-    # Take only the date portion if datetime like "2026-05-26 09:31:33"
     if " " in s:
         s = s.split(" ")[0]
     if "T" in s:
         s = s.split("T")[0]
-
-    # Try known formats
     for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"]:
         try:
             return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except:
             continue
-
-    # Fallback — pandas is very forgiving
     try:
         dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
         if pd.notna(dt):
             return dt.strftime("%Y-%m-%d")
     except:
         pass
-
     return ""
 
 
 def _parse_tags(tag_str):
-    """Split 'AAOX,AAOX-SP-1,IBKR' into ['AAOX', 'AAOX-SP-1', 'IBKR']."""
     s = _clean_str(tag_str)
     if not s:
         return []
@@ -122,7 +107,6 @@ def _parse_tags(tag_str):
 
 
 def _join_tags(tags_list):
-    """Join back to CSV form, deduped, order preserved."""
     seen = set()
     result = []
     for t in tags_list:
@@ -134,11 +118,6 @@ def _join_tags(tags_list):
 
 
 def _safe_html(text):
-    """
-    ⭐ Escape characters that break Streamlit rendering:
-    - `$` → LaTeX math delimiter (biggest culprit)
-    - `<`, `>`, `&` → HTML injection / mangling
-    """
     if text is None:
         return ""
     return (
@@ -149,6 +128,110 @@ def _safe_html(text):
         .replace("$", "&dollar;")
     )
 
+
+# ============================================================
+# Smart trade formatting
+# ============================================================
+
+def _format_trade_label(row):
+    """
+    Get best display label for a trade row.
+    - Options (Tiger): extract "(SOFI 20260821 CALL 23.0)" from description
+    - Options (IBKR): use description like "AAOX 21JUL26 42 P"
+    - Stocks: use description or symbol
+    """
+    asset_class = _clean_str(row.get("AssetClass", "")).upper()
+    desc = _clean_str(row.get("Description", ""))
+    sym = _clean_str(row.get("Symbol", ""))
+
+    if asset_class == "OPT":
+        m = re.search(r'\(([^)]+)\)', desc)
+        if m:
+            inner = m.group(1).strip()
+            if re.search(r'\d', inner):
+                return inner
+
+        if desc:
+            return desc
+
+        return sym
+
+    return desc or sym
+
+
+def _extract_underlying(row):
+    """
+    Get underlying symbol for tag generation.
+    - IBKR:   "AAOX 260717P00042000"       (space-separated)
+    - Moomoo: "MARA260724C17500"           (glued)
+    - Tiger:  Uses UnderlyingSymbol column
+    """
+    us = _clean_str(row.get("UnderlyingSymbol", ""))
+    if us:
+        return us
+
+    sym = _clean_str(row.get("Symbol", ""))
+    asset_class = _clean_str(row.get("AssetClass", "")).upper()
+
+    if asset_class == "OPT" and sym:
+        if " " in sym:
+            return sym.split()[0]
+
+        # Moomoo style: SYMBOL(letters) + YYMMDD + C/P + STRIKE
+        m = re.match(r'^([A-Z]+)\d{6}[CP]\d+$', sym.upper())
+        if m:
+            return m.group(1)
+
+        # Fallback: letters before first digit
+        m = re.match(r'^([A-Z]+)', sym.upper())
+        if m:
+            return m.group(1)
+
+    return sym
+
+
+def _trade_row_to_tags(row):
+    """Clean tag list — underlying + group + platform only. No option code, no strategy."""
+    tags = []
+
+    underlying = _extract_underlying(row)
+    if underlying:
+        tags.append(underlying)
+
+    group = _clean_str(row.get("Group", ""))
+    if group and group not in tags:
+        tags.append(group)
+
+    platform = _clean_str(row.get("Platform", ""))
+    if platform and platform not in tags:
+        tags.append(platform)
+
+    return ",".join(tags)
+
+
+def _trade_row_to_strategy(row):
+    return _clean_str(row.get("Strategy", ""))
+
+
+def _trade_row_to_notes_prefill(row):
+    """Build starter note with option identifier + numbers."""
+    side = _clean_str(row.get("Buy/Sell", ""))
+    label = _format_trade_label(row)
+    qty = _clean_str(row.get("Quantity", ""))
+    price = _clean_str(row.get("TradePrice", ""))
+
+    try:
+        net_f = float(row.get("NetCash", 0))
+        net_str = f" ({'+' if net_f >= 0 else ''}${net_f:,.2f})"
+    except:
+        net_str = ""
+
+    return f"{side} {label} qty {qty} @ {price}{net_str}"
+
+
+# ============================================================
+# LOADERS
+# ============================================================
 
 def _get_journal_mtime():
     if os.path.exists(TRADE_JOURNAL_FILE):
@@ -176,10 +259,8 @@ def _load_journal(mtime):
         if col not in df.columns:
             df[col] = ""
 
-    # ⭐ Normalize dates so sort/join work correctly
     df["Date"] = df["Date"].apply(_normalize_date)
 
-    # ⭐ Runtime dedupe — safety net against messy CSV
     df["_has_be"] = df["Breakeven"].fillna("").str.strip() != ""
     df = df.sort_values("_has_be", ascending=False)
     df = df.drop_duplicates(subset=["Date", "Tags", "Notes"], keep="first")
@@ -228,27 +309,18 @@ ALL_TAGS = _get_all_tags(journal_df)
 
 
 def _get_all_campaign_groups(journal_df, trades_df):
-    """
-    Discover campaign groups from:
-    - trades_history.csv `Group` column
-    - trade_journal.csv `Tags` (tags that match trade Group names or look like campaigns)
-    """
     groups = set()
-
     if not trades_df.empty and "Group" in trades_df.columns:
         for g in trades_df["Group"].dropna().unique():
             gc = _clean_str(g)
             if gc:
                 groups.add(gc)
-
     for tag_str in journal_df["Tags"].dropna():
         for t in _parse_tags(tag_str):
             if t in groups:
                 continue
-            # Convention: campaign tags contain a "-" and a digit somewhere
             if "-" in t and any(c.isdigit() for c in t):
                 groups.add(t)
-
     return sorted(groups)
 
 
@@ -257,7 +329,6 @@ def _get_all_campaign_groups(journal_df, trades_df):
 # ============================================================
 
 def _compute_campaign(group_name, trades_df, journal_df):
-    # ---- Trades side ----
     if not trades_df.empty and "Group" in trades_df.columns:
         gt = trades_df[trades_df["Group"] == group_name].copy()
     else:
@@ -302,7 +373,6 @@ def _compute_campaign(group_name, trades_df, journal_df):
             if sc:
                 strategy_tags.add(sc)
 
-    # ---- Journal side ----
     matching_notes = []
     latest_be = ""
 
@@ -323,7 +393,6 @@ def _compute_campaign(group_name, trades_df, journal_df):
             latest_be = note["breakeven"]
             break
 
-    # ---- Unified timeline (trades + notes by date) ----
     timeline = []
 
     if not gt.empty:
@@ -333,7 +402,7 @@ def _compute_campaign(group_name, trades_df, journal_df):
                 "kind": "trade",
                 "side": _clean_str(r.get("Buy/Sell", "")),
                 "symbol": _clean_str(r.get("Symbol", "")),
-                "description": _clean_str(r.get("Description", "")) or _clean_str(r.get("Symbol", "")),
+                "description": _format_trade_label(r),
                 "quantity": _clean_str(r.get("Quantity", "")),
                 "price": _clean_str(r.get("TradePrice", "")),
                 "net_cash": _clean_str(r.get("NetCash", "")),
@@ -350,7 +419,6 @@ def _compute_campaign(group_name, trades_df, journal_df):
 
     timeline.sort(key=lambda x: x["date"] or "0000-00-00")
 
-    # ---- Metadata ----
     all_dates = [t["date"] for t in timeline if t["date"]]
     start_date = min(all_dates) if all_dates else ""
     end_date = max(all_dates) if all_dates else ""
@@ -394,7 +462,6 @@ def _render_campaign_card(c):
     real_color = "#66FF99" if c["realized"] >= 0 else "#FF6666"
     border_color = "#00D4FF" if c["is_open"] else "#666"
 
-    # Open positions
     pos_html = ""
     if c["open_positions"]:
         for p in c["open_positions"]:
@@ -410,7 +477,6 @@ def _render_campaign_card(c):
     else:
         pos_html = "<div style='color:gray; font-size:13px; padding:4px 0;'>All positions closed</div>"
 
-    # BE display
     if c["latest_be"]:
         be_html = (
             "<div>"
@@ -421,7 +487,6 @@ def _render_campaign_card(c):
     else:
         be_html = ""
 
-    # ⭐ Realized always shown — meaningful for PMCC/CC (closed short calls)
     realized_label = "Final Realized" if not c["is_open"] else "Realized"
     realized_tile = (
         f"<div>"
@@ -440,7 +505,6 @@ def _render_campaign_card(c):
         "margin-left:10px;'>CLOSED</span>"
     )
 
-    # ⭐ Timeline grouped by date, LATEST FIRST
     events_by_date = {}
     for evt in c["timeline"]:
         d = evt["date"] or "—"
@@ -449,10 +513,8 @@ def _render_campaign_card(c):
     timeline_html = ""
     for d in sorted(events_by_date.keys(), reverse=True):
         events = events_by_date[d]
-        # Within same date: notes first (context) then trades
         events.sort(key=lambda e: 0 if e["kind"] == "note" else 1)
 
-        # Date header
         timeline_html += (
             f"<div style='margin-top:20px; margin-bottom:10px; padding-bottom:6px; "
             f"border-bottom:1px solid #444;'>"
@@ -467,7 +529,6 @@ def _render_campaign_card(c):
                 side_color = "#66FF99" if evt["side"] == "SELL" else "#FF9F1C"
                 side_bg = "rgba(102,255,153,0.10)" if evt["side"] == "SELL" else "rgba(255,159,28,0.10)"
 
-                # Format numbers cleanly
                 try:
                     qty_f = float(evt['quantity'])
                     qty_str = f"{qty_f:+.0f}" if abs(qty_f) >= 1 else f"{qty_f:+.4f}"
@@ -486,7 +547,6 @@ def _render_campaign_card(c):
                     net_color2 = "#CCC"
                     net_str = _safe_html(evt['net_cash'])
 
-                # 2-line layout — mobile-friendly
                 timeline_html += (
                     f"<div style='padding:12px 14px; margin:8px 0; "
                     f"background:{side_bg}; border-left:3px solid {side_color}; border-radius:4px;'>"
@@ -500,7 +560,7 @@ def _render_campaign_card(c):
                     f"</div>"
                     f"</div>"
                 )
-            else:  # note
+            else:
                 be_extra = ""
                 if evt["breakeven"]:
                     be_extra = (
@@ -509,7 +569,11 @@ def _render_campaign_card(c):
                         f"BE {_safe_html(evt['breakeven'])}"
                         f"</span>"
                     )
-                safe_text = _safe_html(evt['text']) or "<i>(empty)</i>"
+                safe_text = _safe_html(evt['text'])
+                if safe_text:
+                    safe_text = safe_text.replace("\n", "<br>")
+                else:
+                    safe_text = "<i>(empty)</i>"
                 timeline_html += (
                     f"<div style='padding:12px 14px; margin:8px 0; "
                     f"background:rgba(255,153,204,0.08); border-left:3px solid #FF99CC; border-radius:4px;'>"
@@ -526,10 +590,8 @@ def _render_campaign_card(c):
     if not timeline_html:
         timeline_html = "<div style='color:gray; font-size:13px;'>No activity yet</div>"
 
-    # ⭐ HTML must NOT be indented — Streamlit markdown treats indented lines as code blocks
     card_html = (
         f"<div class='card' style='padding:20px; border-left:4px solid {border_color}; margin-bottom:16px;'>"
-        # ── Header row
         f"<div style='display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:16px; flex-wrap:wrap; gap:8px;'>"
         f"<div>"
         f"<div style='display:flex; align-items:center; flex-wrap:wrap; gap:8px;'>"
@@ -543,7 +605,6 @@ def _render_campaign_card(c):
         f"<div style='color:white; font-size:15px; font-weight:bold;'>{c['n_trades']} / {c['n_notes']}</div>"
         f"</div>"
         f"</div>"
-        # ── Metrics grid
         f"<div style='display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:18px; margin-bottom:16px;'>"
         f"<div>"
         f"<div style='color:gray; font-size:12px;'>Net Premium</div>"
@@ -556,7 +617,6 @@ def _render_campaign_card(c):
         f"<div style='color:white; font-size:20px; font-weight:bold;'>{c['days_running']}</div>"
         f"</div>"
         f"</div>"
-        # ── Open positions
         f"<div style='border-top:1px solid #333; padding-top:12px;'>"
         f"<div style='color:gray; font-size:12px; margin-bottom:8px; text-transform:uppercase; letter-spacing:0.5px;'>Open positions</div>"
         f"{pos_html}"
@@ -566,7 +626,6 @@ def _render_campaign_card(c):
     st.markdown(card_html, unsafe_allow_html=True)
 
     with st.expander(f"📜 Timeline · {c['n_trades']} trades · {c['n_notes']} notes"):
-        # ⭐ Wrap in dark card so white text is visible against expander's white bg
         wrapped_html = (
             f"<div style='background-color:#0E1117; padding:16px 20px 20px 20px; "
             f"border-radius:6px; margin-top:-8px;'>"
@@ -577,39 +636,319 @@ def _render_campaign_card(c):
 
 
 # ============================================================
+# TRADE FILTER
+# ============================================================
+
+def _filter_trades(df, symbol="", platform="All", group="All", days=90):
+    if df.empty:
+        return df
+
+    result = df.copy()
+
+    if symbol.strip():
+        s = symbol.strip().upper()
+        result = result[
+            result["Symbol"].fillna("").str.upper().str.contains(s, na=False)
+            | result.get("Description", pd.Series()).fillna("").str.upper().str.contains(s, na=False)
+        ]
+
+    if platform != "All":
+        result = result[result["Platform"] == platform]
+
+    if group != "All" and "Group" in result.columns:
+        result = result[result["Group"] == group]
+
+    if days > 0 and "TradeDate" in result.columns:
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        result = result[result["TradeDate"] >= cutoff]
+
+    result = result.sort_values("TradeDate", ascending=False)
+    return result
+
+
+# ============================================================
 # ADD ENTRY DIALOG
 # ============================================================
 
 @st.dialog("➕ Add Journal Entry")
 def _add_entry_dialog():
-    # ⭐ Text input instead of date_input — date_input inside dialog has a mobile bug
-    # where the calendar overlay doesn't dismiss properly
-    today_iso = date.today().strftime("%Y-%m-%d")
+    prefill = st.session_state.pop("_journal_prefill", None)
+
+    default_date = date.today().strftime("%Y-%m-%d")
+    default_tags = ""
+    default_strategy = ""
+    default_notes = ""
+
+    if prefill:
+        default_date = prefill.get("date") or default_date
+        default_tags = prefill.get("tags") or ""
+        default_strategy = prefill.get("strategy") or ""
+        default_notes = prefill.get("notes") or ""
+
+        st.session_state["dialog_date"] = default_date
+        st.session_state["dialog_tags"] = default_tags
+        st.session_state["dialog_strategy"] = default_strategy
+        st.session_state["dialog_notes"] = default_notes
+        st.session_state["dialog_be"] = ""
+
+        # Persist prefill status across reruns
+        st.session_state["_dialog_prefill_summary"] = prefill.get("summary", "")
+
+    prefill_summary = st.session_state.get("_dialog_prefill_summary", "")
+    if prefill_summary:
+        st.success(f"✅ Pre-filled from trade: {prefill_summary}")
+
     entry_date_str = st.text_input(
         "Date (YYYY-MM-DD)",
-        value=today_iso,
-        help="Format: YYYY-MM-DD (e.g. 2026-07-19)",
+        value=default_date,
+        key="dialog_date",
     )
 
+    # ============================================================
+    # Reference trades — filter + combine button + scrollable list
+    # ============================================================
+    with st.expander("📊 Reference trades (optional)", expanded=False):
+
+        # Row 1: filter input + combine button
+        filter_col, action_col = st.columns([3, 2])
+
+        with filter_col:
+            # ⭐ Build symbol dropdown from existing trades (reactive)
+            if not trades_df.empty and "Symbol" in trades_df.columns:
+                # Get unique underlyings from trade rows
+                symbols_set = set()
+                for _, tr in trades_df.iterrows():
+                    u = _extract_underlying(tr)
+                    if u:
+                        symbols_set.add(u)
+                symbols_list = sorted(symbols_set)
+            else:
+                symbols_list = []
+
+            options = ["— All / Type below —"] + symbols_list
+
+            selected_symbol = st.selectbox(
+                "Filter by symbol",
+                options=options,
+                key="ref_symbol_select",
+                label_visibility="collapsed",
+            )
+
+            # Fallback text input for custom filter
+            manual_filter = st.text_input(
+                "Or type symbol",
+                key="ref_symbol_filter",
+                placeholder="Type custom symbol...",
+                label_visibility="collapsed",
+            )
+
+            # Use dropdown if picked, else manual
+            if selected_symbol and selected_symbol != "— All / Type below —":
+                symbol_filter = selected_symbol
+            else:
+                symbol_filter = manual_filter
+
+        matching = _filter_trades(trades_df, symbol=symbol_filter, days=365)
+
+        # Count currently-checked trades (before rendering the list)
+        selected_count = 0
+        for k, v in st.session_state.items():
+            if k.startswith("trade_check_") and v is True:
+                selected_count += 1
+
+        with action_col:
+            if selected_count >= 2:
+                if st.button(
+                    f"📋 Combine ({selected_count})",
+                    type="primary",
+                    use_container_width=True,
+                    key="combine_btn_top",
+                ):
+                    selected_trades_data = []
+                    for i, (_, r) in enumerate(matching.head(10).iterrows()):
+                        if st.session_state.get(f"trade_check_{i}", False):
+                            selected_trades_data.append(r)
+
+                    if len(selected_trades_data) >= 2:
+                        # Merge tags
+                        all_tags = []
+                        for tr in selected_trades_data:
+                            for t in _parse_tags(_trade_row_to_tags(tr)):
+                                if t not in all_tags:
+                                    all_tags.append(t)
+
+                        # Strategy — most common
+                        strategies = [_trade_row_to_strategy(tr) for tr in selected_trades_data]
+                        strategies = [s for s in strategies if s]
+                        if strategies:
+                            combined_strategy = max(set(strategies), key=strategies.count)
+                        else:
+                            combined_strategy = ""
+
+                        # Date — most recent
+                        dates = [
+                            _normalize_date(_clean_str(tr.get("TradeDate", "")))
+                            for tr in selected_trades_data
+                        ]
+                        dates = [d for d in dates if d]
+                        combined_date = max(dates) if dates else date.today().strftime("%Y-%m-%d")
+
+                        # Notes — one line per trade + net summary
+                        notes_lines = []
+                        net_total = 0.0
+                        for tr in selected_trades_data:
+                            notes_lines.append(_trade_row_to_notes_prefill(tr))
+                            try:
+                                net_total += float(tr.get("NetCash", 0))
+                            except:
+                                pass
+                        notes_lines.append(f"Net: {'+' if net_total >= 0 else ''}${net_total:,.2f}")
+                        combined_notes = "\n".join(notes_lines)
+
+                        # Summary
+                        summary_parts = []
+                        for tr in selected_trades_data[:2]:
+                            s = _clean_str(tr.get("Buy/Sell", ""))
+                            lbl = _format_trade_label(tr)
+                            summary_parts.append(f"{s} {lbl}")
+                        combined_summary = " + ".join(summary_parts)
+                        if len(selected_trades_data) > 2:
+                            combined_summary += f" (+{len(selected_trades_data) - 2} more)"
+
+                        st.session_state["_journal_prefill"] = {
+                            "date": combined_date,
+                            "tags": ",".join(all_tags),
+                            "strategy": combined_strategy,
+                            "notes": combined_notes,
+                            "summary": combined_summary,
+                        }
+
+                        # Clear checkboxes
+                        for k in list(st.session_state.keys()):
+                            if k.startswith("trade_check_"):
+                                st.session_state.pop(k, None)
+
+                        st.session_state["_reopen_add_dialog"] = True
+                        st.rerun()
+            else:
+                st.caption(f"{selected_count} selected" if selected_count else "Select 2+ to combine")
+
+        # Results count
+        if matching.empty:
+            if symbol_filter.strip():
+                st.caption(f"No matches for '{symbol_filter}'.")
+            else:
+                st.caption("Type a symbol above to search.")
+        else:
+            st.caption(f"Showing {min(len(matching), 10)} of {len(matching)} matches")
+
+            # Scrollable container start
+            st.markdown(
+                "<div style='max-height:400px; overflow-y:auto; padding-right:8px;'>",
+                unsafe_allow_html=True,
+            )
+
+            for i, (_, r) in enumerate(matching.head(10).iterrows()):
+                trade_date_raw = _clean_str(r.get("TradeDate", ""))
+                trade_date = trade_date_raw.split(" ")[0] if " " in trade_date_raw else trade_date_raw
+
+                side = _clean_str(r.get("Buy/Sell", ""))
+                platform = _clean_str(r.get("Platform", ""))
+                label = _format_trade_label(r)
+                qty = _clean_str(r.get("Quantity", ""))
+                price = _clean_str(r.get("TradePrice", ""))
+
+                try:
+                    net_f = float(r.get("NetCash", 0))
+                    net_display = f"{'+' if net_f >= 0 else ''}${net_f:,.0f}"
+                    net_color = "#0A7B3E" if net_f >= 0 else "#DC2626"
+                except:
+                    net_display = ""
+                    net_color = "#666"
+
+                side_color = "#0A7B3E" if side == "SELL" else "#D97706"
+
+                with st.container(border=True):
+                    ck_col, info_col, act_col = st.columns([0.7, 5, 1])
+
+                    with ck_col:
+                        st.checkbox(
+                            "sel",
+                            key=f"trade_check_{i}",
+                            label_visibility="collapsed",
+                        )
+
+                    with info_col:
+                        st.markdown(
+                            f"<div style='font-size:11px; color:#888;'>"
+                            f"{trade_date} · {platform}"
+                            f"</div>"
+                            f"<div style='margin-top:2px;'>"
+                            f"<span style='color:{side_color}; font-weight:700; font-size:13px;'>{_safe_html(side)}</span> "
+                            f"<span style='font-size:13px;'>{_safe_html(label)}</span>"
+                            f"</div>"
+                            f"<div style='font-size:11px; color:#666; margin-top:2px;'>"
+                            f"qty {_safe_html(qty)} @ {_safe_html(price)}"
+                            f" · <span style='color:{net_color}; font-weight:600;'>{net_display}</span>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    with act_col:
+                        if st.button("📋", key=f"copy_trade_{i}", help="Copy this trade only"):
+                            st.session_state["_journal_prefill"] = {
+                                "date": _normalize_date(trade_date_raw),
+                                "tags": _trade_row_to_tags(r),
+                                "strategy": _trade_row_to_strategy(r),
+                                "notes": _trade_row_to_notes_prefill(r),
+                                "summary": f"{trade_date} {side} {label}",
+                            }
+                            for k in list(st.session_state.keys()):
+                                if k.startswith("trade_check_"):
+                                    st.session_state.pop(k, None)
+                            st.session_state["_reopen_add_dialog"] = True
+                            st.rerun()
+
+            # Scrollable container end
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    # ============================================================
+    # Tags, Strategy, Notes, BE
+    # ============================================================
     st.markdown("**Tags** (comma-separated)")
-    st.caption(
-        "Examples: `AAOX,AAOX-SP-1,IBKR,Roll` for a campaign roll · "
-        "`MARA,IBKR,plan` for a trade plan · leave empty for general note"
-    )
 
     if ALL_TAGS:
-        with st.expander("💡 Existing tags — click to copy"):
+        with st.expander("💡 Existing tags"):
             st.markdown(" · ".join([f"`{t}`" for t in ALL_TAGS[:80]]))
 
-    tags_input = st.text_input("Tags", placeholder="AAOX,AAOX-SP-1,IBKR,Roll")
+    tags_input = st.text_input(
+        "Tags",
+        value=default_tags,
+        placeholder="AAOX,AAOX-SP-1,IBKR",
+        key="dialog_tags",
+    )
+
+    strategy_input = st.text_input(
+        "Strategy",
+        value=default_strategy,
+        placeholder="e.g. SP, CC, PMCC, Roll Out and Down",
+        help="Added as a tag on save (auto-populated when copying from trade)",
+        key="dialog_strategy",
+    )
 
     notes = st.text_area(
         "Notes",
+        value=default_notes,
         placeholder="e.g. +$450 credit, total $1450 premium",
-        height=120
+        height=120,
+        key="dialog_notes",
     )
 
-    breakeven = st.text_input("Breakeven (optional)", placeholder="e.g. 25.50")
+    breakeven = st.text_input(
+        "Breakeven (optional)",
+        placeholder="e.g. 25.50",
+        key="dialog_be",
+    )
 
     st.markdown("---")
 
@@ -618,6 +957,11 @@ def _add_entry_dialog():
     if c1.button("✅ Save", type="primary", use_container_width=True):
         if not notes.strip():
             st.error("Notes field cannot be empty.")
+            return
+
+        parsed_date = _normalize_date(entry_date_str)
+        if not parsed_date:
+            st.error("Invalid date. Please use YYYY-MM-DD format.")
             return
 
         try:
@@ -629,14 +973,13 @@ def _add_entry_dialog():
             if col not in existing.columns:
                 existing[col] = ""
 
+        # Merge Strategy field into Tags on save
         parsed_tags = _parse_tags(tags_input)
-        tags_normalized = _join_tags(parsed_tags)
+        strategy_clean = strategy_input.strip()
+        if strategy_clean and strategy_clean not in parsed_tags:
+            parsed_tags.append(strategy_clean)
 
-        # ⭐ Validate the date string user typed (we switched from date_input to text_input)
-        parsed_date = _normalize_date(entry_date_str)
-        if not parsed_date:
-            st.error("Invalid date. Please use YYYY-MM-DD format.")
-            return
+        tags_normalized = _join_tags(parsed_tags)
 
         new_row = {
             "JournalId": str(uuid.uuid4()),
@@ -650,12 +993,34 @@ def _add_entry_dialog():
         new_df = pd.concat([existing, pd.DataFrame([new_row])], ignore_index=True)
         _save_journal(new_df)
 
+        # Clean up widget state so next open starts fresh
+        for k in ["dialog_date", "dialog_tags", "dialog_strategy", "dialog_notes", "dialog_be"]:
+            st.session_state.pop(k, None)
+        st.session_state.pop("_dialog_prefill_summary", None)
+        for k in list(st.session_state.keys()):
+            if k.startswith("trade_check_"):
+                st.session_state.pop(k, None)
+
         st.success("✅ Entry saved.")
         st.cache_data.clear()
         st.rerun()
 
     if c2.button("❌ Cancel", use_container_width=True):
+        for k in ["dialog_date", "dialog_tags", "dialog_strategy", "dialog_notes", "dialog_be"]:
+            st.session_state.pop(k, None)
+        st.session_state.pop("_dialog_prefill_summary", None)
+        for k in list(st.session_state.keys()):
+            if k.startswith("trade_check_"):
+                st.session_state.pop(k, None)
         st.rerun()
+
+
+# ============================================================
+# AUTO-REOPEN DIALOG after Copy click
+# ============================================================
+
+if st.session_state.pop("_reopen_add_dialog", False):
+    _add_entry_dialog()
 
 
 # ============================================================
@@ -668,7 +1033,7 @@ if top_c1.button("➕ Add Journal Entry", use_container_width=True, type="primar
 
 
 # ============================================================
-# SECTION 1 — ACTIVE CAMPAIGNS (auto-discovered)
+# SECTION 1 — ACTIVE CAMPAIGNS
 # ============================================================
 
 st.markdown(
@@ -704,7 +1069,76 @@ st.markdown("---")
 
 
 # ============================================================
-# SECTION 2 — ALL NOTES (editable table with inline delete)
+# SECTION 2 — RECENT TRADES BROWSER
+# ============================================================
+
+st.markdown(
+    "<div class='section-title'>📊 Recent Trades</div>",
+    unsafe_allow_html=True
+)
+
+if trades_df.empty:
+    st.info("No trades in trades_history.csv")
+else:
+    with st.expander("Browse trades to reference", expanded=False):
+        b_c1, b_c2, b_c3, b_c4 = st.columns(4)
+
+        with b_c1:
+            platforms_list = ["All"] + sorted(trades_df["Platform"].dropna().unique().tolist())
+            browse_platform = st.selectbox("Broker", platforms_list, key="browse_platform")
+
+        with b_c2:
+            browse_symbol = st.text_input("Symbol", key="browse_symbol", placeholder="e.g. AAOX")
+
+        with b_c3:
+            if "Group" in trades_df.columns:
+                groups_list = ["All"] + sorted(
+                    [g for g in trades_df["Group"].dropna().unique().tolist() if _clean_str(g)]
+                )
+            else:
+                groups_list = ["All"]
+            browse_group = st.selectbox("Group", groups_list, key="browse_group")
+
+        with b_c4:
+            browse_days = st.selectbox(
+                "Time range",
+                [30, 90, 180, 365, 9999],
+                format_func=lambda x: {30: "30 days", 90: "90 days", 180: "180 days", 365: "1 year", 9999: "All"}.get(x, str(x)),
+                index=2,
+                key="browse_days",
+            )
+
+        browse_result = _filter_trades(
+            trades_df,
+            symbol=browse_symbol,
+            platform=browse_platform,
+            group=browse_group,
+            days=browse_days,
+        )
+
+        st.caption(f"Showing {len(browse_result)} trade(s)")
+
+        if browse_result.empty:
+            st.info("No trades match filters.")
+        else:
+            display_cols = [
+                c for c in [
+                    "TradeDate", "Platform", "Symbol", "Description", "AssetClass",
+                    "Buy/Sell", "Quantity", "TradePrice", "NetCash",
+                    "RealizedPnLSgd", "Strategy", "Group",
+                ] if c in browse_result.columns
+            ]
+            st.dataframe(
+                browse_result[display_cols].head(200),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+st.markdown("---")
+
+
+# ============================================================
+# SECTION 3 — ALL NOTES (editable table with inline delete)
 # ============================================================
 
 st.markdown(
@@ -752,7 +1186,6 @@ else:
     if filtered.empty:
         st.info("No entries match filters.")
     else:
-        # ⭐ Add inline Select checkbox column for delete
         display_cols = ["Select", "Date", "Tags", "Notes", "Breakeven", "CreatedAt", "JournalId"]
         editor_df = filtered.copy()
         editor_df["Select"] = False
@@ -768,10 +1201,7 @@ else:
             key=editor_key,
             column_config={
                 "Select": st.column_config.CheckboxColumn(
-                    "🗑",
-                    help="Check to mark for delete",
-                    default=False,
-                    width="small",
+                    "🗑", help="Check to mark for delete", default=False, width="small",
                 ),
                 "Date": st.column_config.TextColumn("Date"),
                 "Tags": st.column_config.TextColumn("Tags"),
@@ -782,7 +1212,6 @@ else:
             }
         )
 
-        # Style
         st.markdown("""
         <style>
         div[data-testid="stDataEditor"] table { width: 100% !important; }
@@ -801,15 +1230,10 @@ else:
         </style>
         """, unsafe_allow_html=True)
 
-        # ================================
-        # SAVE + DELETE buttons
-        # ================================
         col_save, col_delete = st.columns([1, 1])
 
-        # SAVE — writes back Date/Tags/Notes/Breakeven edits
         if col_save.button("💾 Save Changes", use_container_width=True, type="primary"):
             try:
-                # Pull latest cell edits from session_state
                 state = st.session_state.get(editor_key, None)
                 if isinstance(state, dict) and "edited_rows" in state:
                     edited_df = edited_df.copy()
@@ -825,7 +1249,6 @@ else:
                                     edited_df.columns.get_loc(col)
                                 ] = value
 
-                # Normalize edited fields
                 for col in ["Date", "Tags", "Notes", "Breakeven"]:
                     if col in edited_df.columns:
                         edited_df[col] = edited_df[col].fillna("").astype(str)
@@ -836,7 +1259,6 @@ else:
                 )
                 edited_df["Date"] = edited_df["Date"].apply(_normalize_date)
 
-                # Merge into full journal by JournalId
                 full_df = pd.read_csv(TRADE_JOURNAL_FILE, dtype=str)
                 for col in JOURNAL_SCHEMA:
                     if col not in full_df.columns:
@@ -859,7 +1281,6 @@ else:
             except Exception as e:
                 st.error(f"Save failed: {e}")
 
-        # DELETE — reads checkboxes, opens confirmation dialog
         if col_delete.button("🗑️ Delete Checked Entries", use_container_width=True, type="secondary"):
             state = st.session_state.get(editor_key, None)
             select_map = {}
@@ -872,7 +1293,6 @@ else:
                     if "Select" in changes:
                         select_map[row_pos] = bool(changes["Select"])
 
-            # Collect (JournalId, preview) pairs for checked rows
             to_delete = []
             for i, row in editor_df.iterrows():
                 selected = select_map.get(i, bool(row.get("Select", False)))
@@ -885,7 +1305,6 @@ else:
             if not to_delete:
                 st.warning("No entries checked. Tick the 🗑 column to select rows.")
             else:
-                # Stash in session, dialog reads from here
                 st.session_state["_pending_delete_ids"] = to_delete
                 st.rerun()
 
@@ -901,7 +1320,6 @@ def _confirm_delete_dialog(pending):
     st.caption("This action cannot be undone.")
 
     st.markdown("**Entries to delete:**")
-    # ⭐ Dark background wrapper — dialog uses white bg, need dark for readable text
     preview_html = (
         "<div style='background:#0E1117; padding:14px; border-left:3px solid #FF6666; "
         "border-radius:6px; max-height:220px; overflow-y:auto;'>"
@@ -943,7 +1361,6 @@ def _confirm_delete_dialog(pending):
         st.rerun()
 
 
-# Trigger the confirmation dialog if there's a pending delete
 if st.session_state.get("_pending_delete_ids"):
     _confirm_delete_dialog(st.session_state["_pending_delete_ids"])
 
