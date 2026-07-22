@@ -171,12 +171,35 @@ def _activity_to_buy_sell(activity_type, quantity=None):
 
 
 def _normalize_trade_date(trade_time):
+    """
+    Normalize Tiger trade time -> DD/MM/YYYY
+    to match Moomoo/IBKR format in trades_history.csv.
+
+    Tiger raw input examples:
+        '2026-07-14 10:21:18,'
+        '2026-07-14 10:21:18'
+        '2026-07-14'
+    """
     s = str(trade_time).strip()
-    if s == "":
+    if s == "" or s.lower() == "nan":
         return ""
+
+    # Clean trailing commas + whitespace
     s = s.rstrip(",").strip()
+
+    # Drop time portion if present
     if " " in s:
         s = s.split(" ")[0]
+
+    # Try parsing ISO format first (Tiger's default)
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%d/%m/%Y")
+        except ValueError:
+            continue
+
+    # Fallback: return as-is if unparseable
     return s
 
 
@@ -763,10 +786,15 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
         combined = combined[UNIFIED_TRADES_COLS]
 
         if "TradeDate" in combined.columns:
+            # ⭐ Parse DD/MM/YYYY as datetime just for sorting
+            combined["_sort_date"] = pd.to_datetime(
+                combined["TradeDate"], format="%d/%m/%Y", errors="coerce"
+            )
             combined = combined.sort_values(
-                ["Platform", "TradeDate", "Symbol"],
+                ["Platform", "_sort_date", "Symbol"],
                 ascending=[True, False, True]
             )
+            combined = combined.drop(columns=["_sort_date"])
 
         combined.to_csv(TRADES_HISTORY_FILE, index=False)
         return load_trades_history()
@@ -829,10 +857,15 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
     combined = combined[UNIFIED_TRADES_COLS]
 
     if "TradeDate" in combined.columns:
+        # ⭐ Parse DD/MM/YYYY as datetime just for sorting
+        combined["_sort_date"] = pd.to_datetime(
+            combined["TradeDate"], format="%d/%m/%Y", errors="coerce"
+        )
         combined = combined.sort_values(
-            ["Platform", "TradeDate", "Symbol"],
+            ["Platform", "_sort_date", "Symbol"],
             ascending=[True, False, True]
         )
+        combined = combined.drop(columns=["_sort_date"])
 
     combined.to_csv(TRADES_HISTORY_FILE, index=False)
 

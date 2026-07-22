@@ -630,10 +630,17 @@ def save_trades_history(file_obj, usd_to_sgd=None, hkd_to_sgd=None, snapshot_fil
     combined = _recompute_fifo_for_platform(combined, "Moomoo")
 
     if "TradeDate" in combined.columns:
+        # ⭐ Parse TradeDate as datetime just for sorting.
+        # dayfirst=True handles: 10/7/2023, 10/07/2023, 21/11/2025, etc.
+        # Works across all platforms (IBKR, Tiger, Moomoo) uniformly.
+        combined["_sort_date"] = pd.to_datetime(
+            combined["TradeDate"], errors="coerce", dayfirst=True
+        )
         combined = combined.sort_values(
-            ["Platform", "TradeDate", "Symbol"],
+            ["Platform", "_sort_date", "Symbol"],
             ascending=[True, False, True]
         )
+        combined = combined.drop(columns=["_sort_date"])
 
     combined.to_csv(TRADES_HISTORY_FILE, index=False)
     return load_trades_history()
@@ -686,7 +693,13 @@ def _recompute_fifo_for_platform(all_trades_df, platform):
     sub["_usdsgd"] = pd.to_numeric(sub["UsdToSgd"], errors="coerce")
     sub["_usdsgd"] = sub["_usdsgd"].fillna(DEFAULT_USDSGD)
 
-    sub = sub.sort_values("TradeDate", ascending=True)
+    # ⭐ Parse TradeDate to real datetime for correct FIFO chronological order.
+    # dayfirst=True handles D/M/YYYY (Moomoo), DD/MM/YYYY (Tiger/IBKR).
+    sub["_sort_date"] = pd.to_datetime(
+        sub["TradeDate"], errors="coerce", dayfirst=True
+    )
+    sub = sub.sort_values("_sort_date", ascending=True)
+    sub = sub.drop(columns=["_sort_date"])
     sub_index_order = sub.index.tolist()
 
     realized = {idx: 0.0 for idx in sub_index_order}

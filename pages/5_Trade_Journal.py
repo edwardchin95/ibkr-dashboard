@@ -77,6 +77,7 @@ def _clean_str(v, default=""):
 
 
 def _normalize_date(s):
+    """⭐ Normalize any date input to DD/MM/YYYY (unified format)."""
     s = _clean_str(s)
     if not s:
         return ""
@@ -87,13 +88,13 @@ def _normalize_date(s):
         s = s.split("T")[0]
     for fmt in ["%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"]:
         try:
-            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(s, fmt).strftime("%d/%m/%Y")
         except:
             continue
     try:
         dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
         if pd.notna(dt):
-            return dt.strftime("%Y-%m-%d")
+            return dt.strftime("%d/%m/%Y")
     except:
         pass
     return ""
@@ -124,6 +125,24 @@ def _parse_groups(group_str):
         return []
     return [g.strip() for g in s.split(",") if g.strip()]
 
+def _is_cycle_strategy(group_name):
+    """
+    ⭐ Detect if a campaign follows a cycle-based strategy that shares a
+    "core" position across multiple cycles. Used to show Close Cycle button.
+
+    Matches: PMCC, CC, COLLAR, DIAG, CAL, WHEEL
+    Does NOT match: SP, SYN, LEAP, HOLD, verticals, standalone strategies
+
+    Expects TICKER-STRATEGY-N naming (segment-matched to avoid false positives
+    like MCCA matching "CC").
+    """
+    CYCLE_STRATEGIES = {"PMCC", "CC", "COLLAR", "DIAG", "CAL", "WHEEL"}
+    parts = group_name.upper().split("-")
+    if len(parts) < 2:
+        return False
+    # Check middle segments (skip ticker at start, number at end if present)
+    segments_to_check = parts[1:-1] if len(parts) >= 3 else parts[1:]
+    return any(seg in CYCLE_STRATEGIES for seg in segments_to_check)
 
 def _safe_html(text):
     if text is None:
@@ -347,8 +366,31 @@ def _compute_campaign(group_name, trades_df, journal_df):
     strategy_tags = set()
 
     if not gt.empty:
-        net_cash_series = pd.to_numeric(gt.get("NetCash", 0), errors="coerce").fillna(0)
-        net_cash = float(net_cash_series.sum())
+        # ⭐ Net Premium as cash-flow convention:
+        #   SELL → positive (premium received)
+        #   BUY  → negative (premium paid)
+        # IBKR/Moomoo: NetCash already correct → use as-is
+        # Tiger:       NetCash uses position-value convention → negate
+        def _cash_flow(row):
+            net_cash_val = pd.to_numeric(row.get("NetCash", 0), errors="coerce")
+            if pd.isna(net_cash_val):
+                # Fallback: derive from Qty × Price × Mult
+                qty = pd.to_numeric(row.get("Quantity", 0), errors="coerce")
+                price = pd.to_numeric(row.get("TradePrice", 0), errors="coerce")
+                if pd.isna(qty) or pd.isna(price):
+                    return 0.0
+                asset_class = str(row.get("AssetClass", "")).upper().strip()
+                mult = 100 if asset_class == "OPT" else 1
+                gross = abs(float(qty)) * float(price) * mult
+                side = str(row.get("Buy/Sell", "")).upper().strip()
+                return gross if side == "SELL" else -gross
+
+            platform = str(row.get("Platform", "")).strip()
+            if platform == "Tiger":
+                return -float(net_cash_val)  # Flip Tiger's inverted sign
+            return float(net_cash_val)
+
+        net_cash = float(gt.apply(_cash_flow, axis=1).sum())
 
         if "RealizedPnLSgd" in gt.columns:
             rs = pd.to_numeric(gt["RealizedPnLSgd"], errors="coerce").fillna(0)
@@ -356,12 +398,41 @@ def _compute_campaign(group_name, trades_df, journal_df):
             rs = pd.to_numeric(gt.get("RealizedPnL", 0), errors="coerce").fillna(0)
         realized = float(rs.sum())
 
-        for symbol, sym_df in gt.groupby("Symbol"):
-            if not symbol or pd.isna(symbol):
+        gt_grp = gt.copy()
+        gt_grp["_grp_key"] = (
+            gt_grp["Symbol"].fillna("").astype(str)
+            + "||"
+            + gt_grp.get("Description", pd.Series([""] * len(gt_grp))).fillna("").astype(str)
+        )
+
+        # ⭐ Compute SIGNED quantity: abs(qty) * (-1 if SELL else +1)
+        # Robust to brokers that store unsigned Quantity (Moomoo)
+        # AND brokers that already store signed (Tiger, IBKR).
+        def _signed_qty(row):
+            q = pd.to_numeric(row.get("Quantity", 0), errors="coerce")
+            if pd.isna(q):
+                return 0.0
+            q = abs(float(q))
+            side = str(row.get("Buy/Sell", "")).upper().strip()
+            if side == "SELL":
+                return -q
+            return q
+
+        gt_grp["_signed_qty"] = gt_grp.apply(_signed_qty, axis=1)
+
+        for grp_key, sym_df in gt_grp.groupby("_grp_key"):
+            symbol = _clean_str(sym_df.iloc[0].get("Symbol", ""))
+            if not symbol:
                 continue
-            qty = pd.to_numeric(sym_df.get("Quantity", 0), errors="coerce").fillna(0).sum()
+            qty = float(sym_df["_signed_qty"].sum())
             if abs(qty) > 0.001:
-                latest = sym_df.sort_values("TradeDate", ascending=False).iloc[0]
+                sym_df_sorted = sym_df.copy()
+                sym_df_sorted["_sort_date"] = pd.to_datetime(
+                    sym_df_sorted["TradeDate"], errors="coerce", dayfirst=True
+                )
+                latest = sym_df_sorted.sort_values(
+                    "_sort_date", ascending=False
+                ).iloc[0]
                 open_positions.append({
                     "symbol": symbol,
                     "description": _clean_str(latest.get("Description", "")) or symbol,
@@ -402,7 +473,13 @@ def _compute_campaign(group_name, trades_df, journal_df):
             "journal_id": _clean_str(r.get("JournalId", "")),
         })
 
-    matching_notes.sort(key=lambda x: x["date"], reverse=True)
+    def _to_dt(d):
+        try:
+            return datetime.strptime(d, "%d/%m/%Y")
+        except:
+            return datetime.min
+    matching_notes.sort(key=lambda x: _to_dt(x["date"]), reverse=True)
+
     for note in matching_notes:
         if note["breakeven"]:
             latest_be = note["breakeven"]
@@ -412,17 +489,27 @@ def _compute_campaign(group_name, trades_df, journal_df):
 
     if not gt.empty:
         for _, r in gt.iterrows():
+            # ⭐ Sign the display quantity by Buy/Sell direction
+            raw_qty = pd.to_numeric(r.get("Quantity", 0), errors="coerce")
+            if pd.notna(raw_qty):
+                signed = abs(float(raw_qty))
+                if str(r.get("Buy/Sell", "")).upper().strip() == "SELL":
+                    signed = -signed
+                qty_display = str(signed)
+            else:
+                qty_display = _clean_str(r.get("Quantity", ""))
+
             timeline.append({
                 "date": _normalize_date(r.get("TradeDate", "")),
                 "kind": "trade",
                 "side": _clean_str(r.get("Buy/Sell", "")),
                 "symbol": _clean_str(r.get("Symbol", "")),
                 "description": _format_trade_label(r),
-                "quantity": _clean_str(r.get("Quantity", "")),
+                "quantity": qty_display,
                 "price": _clean_str(r.get("TradePrice", "")),
                 "net_cash": _clean_str(r.get("NetCash", "")),
             })
-
+            
     for note in matching_notes:
         timeline.append({
             "date": note["date"],
@@ -432,7 +519,7 @@ def _compute_campaign(group_name, trades_df, journal_df):
             "tags": note["tags"],
         })
 
-    timeline.sort(key=lambda x: x["date"] or "0000-00-00")
+    timeline.sort(key=lambda x: _to_dt(x["date"]) if x["date"] else datetime.min)
 
     # ⭐ Days Running — based on earliest journal date (campaign conception),
     # fallback to earliest trade date if no journal entries
@@ -443,20 +530,30 @@ def _compute_campaign(group_name, trades_df, journal_df):
     ] if not gt.empty else []
     trade_dates = [d for d in trade_dates if d]
 
+    def _min_date(dates):
+        parsed = [(d, _to_dt(d)) for d in dates if d]
+        parsed = [(s, dt) for s, dt in parsed if dt != datetime.min]
+        return min(parsed, key=lambda x: x[1])[0] if parsed else ""
+
+    def _max_date(dates):
+        parsed = [(d, _to_dt(d)) for d in dates if d]
+        parsed = [(s, dt) for s, dt in parsed if dt != datetime.min]
+        return max(parsed, key=lambda x: x[1])[0] if parsed else ""
+
     if journal_dates:
-        start_date = min(journal_dates)
+        start_date = _min_date(journal_dates)
     elif trade_dates:
-        start_date = min(trade_dates)
+        start_date = _min_date(trade_dates)
     else:
         start_date = ""
 
     all_dates = journal_dates + trade_dates
-    end_date = max(all_dates) if all_dates else ""
+    end_date = _max_date(all_dates)
 
     days_running = 0
     if start_date:
         try:
-            sd = datetime.strptime(start_date, "%Y-%m-%d")
+            sd = datetime.strptime(start_date, "%d/%m/%Y")
             days_running = (datetime.now() - sd).days
         except:
             pass
@@ -541,7 +638,12 @@ def _render_campaign_card(c):
         events_by_date.setdefault(d, []).append(evt)
 
     timeline_html = ""
-    for d in sorted(events_by_date.keys(), reverse=True):
+    def _card_dt(d):
+        try:
+            return datetime.strptime(d, "%d/%m/%Y")
+        except:
+            return datetime.min
+    for d in sorted(events_by_date.keys(), key=_card_dt, reverse=True):
         events = events_by_date[d]
         events.sort(key=lambda e: 0 if e["kind"] == "note" else 1)
 
@@ -655,6 +757,25 @@ def _render_campaign_card(c):
     )
     st.markdown(card_html, unsafe_allow_html=True)
 
+    # ⭐ Helper button for cycle-based strategies (PMCC, CC, COLLAR, DIAG, CAL, WHEEL)
+    # Untags this campaign from any shared "core" position (e.g. LEAPS, long stock).
+    if _is_cycle_strategy(c["group"]) and c["is_open"]:
+        btn_col, _ = st.columns([1, 3])
+        with btn_col:
+            if st.button(
+                "🔓 Close Cycle",
+                key=f"close_cycle_{c['group']}",
+                help=(
+                    "Remove this campaign tag from any trade shared with another "
+                    "campaign (e.g. LEAPS, long stock, back-month option). Trades "
+                    "tagged ONLY with this campaign stay untouched. Use when the "
+                    "cycle's short leg is closed and you want to end this cycle."
+                ),
+                use_container_width=True,
+            ):
+                st.session_state["_pending_close_cycle"] = c["group"]
+                st.rerun()
+
     with st.expander(f"📜 Timeline · {c['n_trades']} trades · {c['n_notes']} notes"):
         wrapped_html = (
             f"<div style='background-color:#0E1117; padding:16px 20px 20px 20px; "
@@ -690,11 +811,32 @@ def _filter_trades(df, symbol="", platform="All", group="All", days=90):
             result["Group"].fillna("").apply(lambda g: group in _parse_groups(g))
         ]
 
-    if days > 0 and "TradeDate" in result.columns:
-        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        result = result[result["TradeDate"] >= cutoff]
+    if "TradeDate" in result.columns:
 
-    result = result.sort_values("TradeDate", ascending=False)
+        result = result.copy()
+
+        result["_sort_date"] = pd.to_datetime(
+            result["TradeDate"],
+            errors="coerce",
+            dayfirst=True
+        )
+
+        if days > 0:
+            cutoff = datetime.now() - timedelta(days=days)
+            result = result[
+                result["_sort_date"] >= cutoff
+            ]
+
+        result = result.sort_values(
+            "_sort_date",
+            ascending=False
+        )
+
+        result = result.drop(
+            columns=["_sort_date"],
+            errors="ignore"
+        )
+
     return result
 
 
@@ -706,7 +848,7 @@ def _filter_trades(df, symbol="", platform="All", group="All", days=90):
 def _add_entry_dialog():
     prefill = st.session_state.pop("_journal_prefill", None)
 
-    default_date = date.today().strftime("%Y-%m-%d")
+    default_date = date.today().strftime("%d/%m/%Y")
     default_tags = ""
     default_strategy = ""
     default_notes = ""
@@ -730,7 +872,7 @@ def _add_entry_dialog():
         st.success(f"✅ Pre-filled from trade: {prefill_summary}")
 
     entry_date_str = st.text_input(
-        "Date (YYYY-MM-DD)",
+        "Date (DD/MM/YYYY)",
         value=default_date,
         key="dialog_date",
     )
@@ -786,7 +928,7 @@ def _add_entry_dialog():
                             for tr in selected_trades_data
                         ]
                         dates = [d for d in dates if d]
-                        combined_date = max(dates) if dates else date.today().strftime("%Y-%m-%d")
+                        combined_date = max(dates) if dates else date.today().strftime("%d/%m/%Y")
 
                         notes_lines = []
                         net_total = 0.0
@@ -959,7 +1101,7 @@ def _add_entry_dialog():
 
         parsed_date = _normalize_date(entry_date_str)
         if not parsed_date:
-            st.error("Invalid date. Please use YYYY-MM-DD format.")
+            st.error("Invalid date. Please use DD/MM/YYYY format.")
             return
 
         try:
@@ -980,7 +1122,7 @@ def _add_entry_dialog():
 
         new_row = {
             "JournalId": str(uuid.uuid4()),
-            "CreatedAt": datetime.now().isoformat(),
+            "CreatedAt": date.today().strftime("%d/%m/%Y"),
             "Date": parsed_date,
             "Tags": tags_normalized,
             "Notes": notes.strip(),
@@ -1367,7 +1509,12 @@ else:
             filtered["Notes"].fillna("").str.contains(search_query, case=False, na=False)
         ]
 
-    filtered = filtered.sort_values("Date", ascending=False)
+    filtered = filtered.copy()
+    filtered["_sort_date"] = pd.to_datetime(
+        filtered["Date"], errors="coerce", dayfirst=True
+    )
+    filtered = filtered.sort_values("_sort_date", ascending=False)
+    filtered = filtered.drop(columns=["_sort_date"])
 
     st.caption(f"Showing **{len(filtered)}** of {len(journal_df)} entries")
 
@@ -1530,7 +1677,119 @@ def _confirm_delete_dialog(pending):
         st.session_state.pop("_pending_delete_ids", None)
         st.rerun()
 
+# ============================================================
+# CONFIRM CLOSE PMCC DIALOG
+# ============================================================
 
+@st.dialog("🔓 Close Cycle")
+def _close_pmcc_dialog(campaign_name):
+    st.markdown(f"About to close **`{campaign_name}`**")
+    st.caption(
+        f"This removes `{campaign_name}` from any trade that has MULTIPLE "
+        f"campaign tags. Trades tagged ONLY with `{campaign_name}` stay untouched. "
+        f"After this, the campaign will correctly show as CLOSED."
+    )
+
+    try:
+        trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+    except:
+        st.error("Failed to read trades_history.csv")
+        return
+
+    if "Group" not in trades.columns:
+        st.error("No Group column found in trades_history.csv")
+        return
+
+    # Find shared trades (this campaign + at least one other)
+    def _is_shared(g_str):
+        groups = _parse_groups(g_str)
+        return campaign_name in groups and len(groups) > 1
+
+    affected = trades[trades["Group"].fillna("").apply(_is_shared)]
+
+    if affected.empty:
+        st.warning(
+            f"No shared trades found for `{campaign_name}`. "
+            f"All its legs are tagged only with this campaign — "
+            f"nothing to untag. This campaign has no cycle to close."
+        )
+        st.markdown("---")
+        if st.button("❌ OK", use_container_width=True):
+            st.session_state.pop("_pending_close_cycle", None)
+            st.rerun()
+        return
+
+    st.markdown(f"**{len(affected)} shared trade(s) will be untagged:**")
+
+    preview_html = (
+        "<div style='background:#0E1117; padding:14px; border-left:3px solid #FFC300; "
+        "border-radius:6px; max-height:260px; overflow-y:auto;'>"
+    )
+    for _, r in affected.head(20).iterrows():
+        groups_now = _parse_groups(r.get("Group", ""))
+        groups_after = [g for g in groups_now if g != campaign_name]
+        after_str = ",".join(groups_after) if groups_after else "(empty)"
+        preview_html += (
+            f"<div style='color:#EEE; font-size:13px; padding:5px 0; line-height:1.5;'>"
+            f"• <b>{_safe_html(_clean_str(r.get('TradeDate', '')))}</b> "
+            f"{_safe_html(_clean_str(r.get('Buy/Sell', '')))} "
+            f"{_safe_html(_format_trade_label(r))}"
+            f"<br>"
+            f"<span style='color:#999; font-size:11px; margin-left:12px;'>"
+            f"<code>{_safe_html(','.join(groups_now))}</code> "
+            f"→ <code style='color:#66FF99;'>{_safe_html(after_str)}</code>"
+            f"</span>"
+            f"</div>"
+        )
+    if len(affected) > 20:
+        preview_html += (
+            f"<div style='color:#999; font-size:12px; padding-top:8px;'>"
+            f"… and {len(affected) - 20} more"
+            f"</div>"
+        )
+    preview_html += "</div>"
+    st.markdown(preview_html, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    c1, c2 = st.columns(2)
+
+    if c1.button("✅ Yes, Close Cycle", type="primary", use_container_width=True):
+        try:
+            full_trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+            if "Group" not in full_trades.columns:
+                full_trades["Group"] = ""
+
+            def _untag(g_str):
+                groups = _parse_groups(g_str)
+                if campaign_name not in groups:
+                    return g_str
+                if len(groups) == 1:
+                    return g_str  # Sole owner — leave alone
+                remaining = [g for g in groups if g != campaign_name]
+                return ",".join(remaining)
+
+            full_trades["Group"] = full_trades["Group"].fillna("").apply(_untag)
+            full_trades.to_csv(TRADES_HISTORY_FILE, index=False)
+
+            st.session_state.pop("_pending_close_cycle", None)
+            st.success(
+                f"✅ Closed `{campaign_name}`. "
+                f"{len(affected)} shared trade(s) untagged."
+            )
+            st.cache_data.clear()
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed: {e}")
+
+    if c2.button("❌ Cancel", use_container_width=True):
+        st.session_state.pop("_pending_close_cycle", None)
+        st.rerun()
+
+
+if st.session_state.get("_pending_close_cycle"):
+    _close_pmcc_dialog(st.session_state["_pending_close_cycle"])
+    
 if st.session_state.get("_pending_delete_ids"):
     _confirm_delete_dialog(st.session_state["_pending_delete_ids"])
 
