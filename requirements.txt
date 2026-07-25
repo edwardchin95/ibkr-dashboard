@@ -4,3 +4,4 @@ plotly
 google-cloud-storage
 pandas-market-calendars
 yfinance
+tzdata

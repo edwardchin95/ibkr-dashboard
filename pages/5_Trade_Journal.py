@@ -14,7 +14,23 @@ from app import (
     TRADES_HISTORY_FILE,
 )
 
+# --- DTE anchored to US market close (16:00 ET) ---
+try:
+    from zoneinfo import ZoneInfo
+    _MARKET_TZ = ZoneInfo("America/New_York")   # auto EDT/EST
+except Exception:
+    _MARKET_TZ = None
 
+def _dte_from_expiry(exp_dt):
+    """Days to 16:00 ET on expiry date. >0 left · 0 today · <0 expired N days ago."""
+    if _MARKET_TZ is not None:
+        close = datetime(exp_dt.year, exp_dt.month, exp_dt.day, 16, 0, tzinfo=_MARKET_TZ)
+        now = datetime.now(_MARKET_TZ)
+    else:
+        close = datetime(exp_dt.year, exp_dt.month, exp_dt.day, 20, 0)  # ~16:00 EDT in UTC
+        now = datetime.utcnow()
+    secs = (close - now).total_seconds()
+    return int(secs // 86400) if secs >= 0 else -int((-secs) // 86400)
 # ============================================================
 # AUTH + STYLING
 # ============================================================
@@ -743,7 +759,7 @@ def _compute_campaign(group_name, trades_df, journal_df):
                         exp_dt = None
 
             if exp_dt is not None:
-                _exp_days.append((exp_dt - datetime.now()).days)
+                _exp_days.append(_dte_from_expiry(exp_dt))
 
         if _exp_days:
             dte_nearest = min(_exp_days)
@@ -903,7 +919,12 @@ def _metrics_html(c):
     dte = c.get("dte_nearest")
     if c["is_open"] and dte is not None:
         dte_color = "#FF6666" if dte <= 7 else ("#FFC300" if dte <= 21 else "white")
-        dte_str = f"{dte}d" if dte >= 0 else f"EXPIRED {-dte}d ago"
+        if dte > 0:
+            dte_str = f"{dte}d"
+        elif dte == 0:
+            dte_str = "TODAY"
+        else:
+            dte_str = f"EXPIRED {-dte}d ago"
         tiles.append(_metric("DTE", f"<span style='color:{dte_color};'>{dte_str}</span>"))
 
     return "<div class='metric-row'>" + "".join(tiles) + "</div>"

@@ -50,29 +50,16 @@ PLATFORMS = {
     "Moomoo": MOOMOO_SNAPSHOT_DIR,
 }
 
-DEPLOY_MARKER = os.path.join(SNAPSHOT_DIR, ".snapshot_manager_deployed")
+# Snapshots whose START DATE falls on or after this cutoff are guaranteed
+# to be correctly recorded with a SnapshotFile column in trades_history.csv
+# (schema change took effect from this date onward). Anything before this
+# cutoff may not be fully/consistently tagged, so it is locked (read-only).
+DELETE_CUTOFF = datetime(2026, 7, 16)
 
 
 # ============================================================
 # HELPERS
 # ============================================================
-
-def _get_deploy_cutoff():
-    if not os.path.exists(DEPLOY_MARKER):
-        try:
-            os.makedirs(os.path.dirname(DEPLOY_MARKER), exist_ok=True)
-            with open(DEPLOY_MARKER, "w") as f:
-                f.write(datetime.now().isoformat())
-        except:
-            pass
-    try:
-        return os.path.getmtime(DEPLOY_MARKER)
-    except:
-        return datetime.now().timestamp()
-
-
-DEPLOY_CUTOFF = _get_deploy_cutoff()
-
 
 def _load_history():
     if not os.path.exists(HISTORY_FILE):
@@ -158,15 +145,20 @@ def _count_impact(snapshot_name, platform, history_df, trades_df):
     return portfolio_rows, trade_rows
 
 
-def _is_deletable(platform, snapshot_name):
-    snap_dir = PLATFORMS.get(platform)
-    if not snap_dir:
-        return False
-    snap_path = os.path.join(snap_dir, snapshot_name)
-    if not os.path.exists(snap_path):
+def _is_deletable(snapshot_name):
+    """
+    Allow deletion only for snapshots whose START DATE is on or after
+    16 Jul 2026 — this is the first snapshot correctly recorded with
+    SnapshotFile in trades_history.csv under the new schema. Snapshots
+    starting before this cutoff are locked (read-only), since older
+    trade rows may not have a reliable SnapshotFile linkage.
+    """
+    start, _ = _extract_date_range(snapshot_name)
+    if not start:
         return False
     try:
-        return os.path.getmtime(snap_path) >= DEPLOY_CUTOFF
+        start_dt = datetime.strptime(start, "%Y-%m-%d")
+        return start_dt >= DELETE_CUTOFF
     except:
         return False
 
@@ -407,7 +399,7 @@ else:
                     portfolio_rows, trade_rows = _count_impact(
                         snapshot_name, platform, history_df, trades_df
                     )
-                    deletable = _is_deletable(platform, snapshot_name)
+                    deletable = _is_deletable(snapshot_name)
 
                     range_title = (
                         f"{start_pretty} → {end_pretty}"
