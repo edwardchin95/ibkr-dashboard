@@ -1152,7 +1152,7 @@ def _filter_trades(df, symbol="", platform="All", group="All", days=90):
         result["_sort_date"] = pd.to_datetime(result["TradeDate"], errors="coerce", dayfirst=True)
         if days > 0:
             cutoff = datetime.now() - timedelta(days=days)
-            result = result[result["_sort_date"] >= cutoff]
+            result = result[(result["_sort_date"] >= cutoff) | (result["_sort_date"].isna())]
         result = result.sort_values("_sort_date", ascending=False)
         result = result.drop(columns=["_sort_date"], errors="ignore")
     return result
@@ -1732,12 +1732,15 @@ else:
 
         show_unassigned_only = st.checkbox("Show only blank Group (excludes _ignore)", key="assign_show_unassigned")
 
-        assign_result = _filter_trades(trades_df, symbol=assign_symbol, platform=assign_platform, days=assign_days)
+        # When hunting blanks, ignore the date window so nothing hides outside 180d
+        effective_days = 0 if show_unassigned_only else assign_days
+        assign_result = _filter_trades(trades_df, symbol=assign_symbol, platform=assign_platform, days=effective_days)
 
         if show_unassigned_only and "Group" in assign_result.columns:
             assign_result = assign_result[assign_result["Group"].fillna("").apply(lambda g: _clean_str(g) == "")]
 
-        st.caption(f"Showing {len(assign_result)} trade(s)")
+        _blank_now = int(assign_result["Group"].fillna("").apply(lambda g: _clean_str(g) == "").sum()) if "Group" in assign_result.columns else 0
+        st.caption(f"Showing {len(assign_result)} trade(s) · {_blank_now} blank in view")
 
         if assign_symbol.strip():
             ticker = assign_symbol.strip().upper()

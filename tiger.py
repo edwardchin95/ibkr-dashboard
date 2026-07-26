@@ -195,7 +195,7 @@ def _normalize_trade_date(trade_time):
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y"):
         try:
             dt = datetime.strptime(s, fmt)
-            return dt.strftime("%d/%m/%Y")
+            return f"{dt.day}/{dt.month}/{dt.year}"
         except ValueError:
             continue
 
@@ -829,11 +829,13 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
         subset=key_cols, keep="last"
     )
 
+    if snapshot_file and "SnapshotFile" in existing.columns:
+        existing = existing[existing["SnapshotFile"].astype(str) != str(snapshot_file)]
     combined = pd.concat([existing, new_trades], ignore_index=True)
-
-    combined = combined.drop_duplicates(
-        subset=key_cols, keep="last"
-    )
+    combined["_snap"] = combined["SnapshotFile"].fillna("").astype(str) if "SnapshotFile" in combined.columns else ""
+    combined["_seq"] = combined.groupby(["_snap"] + key_cols).cumcount()
+    combined = combined.drop_duplicates(subset=key_cols + ["_seq"], keep="last")
+    combined = combined.drop(columns=["_seq", "_snap"], errors="ignore")
 
     combined = combined.merge(
         existing_journal,

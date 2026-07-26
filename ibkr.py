@@ -88,20 +88,20 @@ def _safe_float(value, default=0):
 
 
 def _format_trade_date(value):
-    """
-    IBKR TradeDate is usually YYYYMMDD.
-    Convert to YYYY-MM-DD for consistency.
-    """
+    """Normalise ANY IBKR TradeDate to dd/m/yyyy (matches rest of app)."""
     s = str(value).strip()
-
-    if len(s) == 8 and s.isdigit():
-        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
-
-    if " " in s:
-        return s.split(" ")[0]
-
-    return s
-
+    if not s or s.lower() == "nan":
+        return ""
+    core = re.split(r"[ ;T]", s)[0].strip()          # drop time part
+    digits = re.sub(r"\D", "", core)
+    if len(digits) >= 8 and "-" not in core and "/" not in core:   # YYYYMMDD
+        y, mo, d = digits[:4], digits[4:6], digits[6:8]
+        return f"{int(d)}/{int(mo)}/{y}"
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", core)                # ISO with dashes
+    if m:
+        y, mo, d = m.groups()
+        return f"{int(d)}/{int(mo)}/{y}"
+    return core
 
 # ============================================================
 # EXTRACT NAV + CASH
@@ -1033,12 +1033,13 @@ def save_trades_history(file_obj, fx_ratio=None, snapshot_file=""):
         keep="last"
     )
 
+    if snapshot_file and "SnapshotFile" in existing.columns:
+        existing = existing[existing["SnapshotFile"].astype(str) != str(snapshot_file)]
     combined = pd.concat([existing, new_trades], ignore_index=True)
-
-    combined = combined.drop_duplicates(
-        subset=key_cols,
-        keep="last"
-    )
+    combined["_snap"] = combined["SnapshotFile"].fillna("").astype(str) if "SnapshotFile" in combined.columns else ""
+    combined["_seq"] = combined.groupby(["_snap"] + key_cols).cumcount()
+    combined = combined.drop_duplicates(subset=key_cols + ["_seq"], keep="last")
+    combined = combined.drop(columns=["_seq", "_snap"], errors="ignore")
 
     combined = combined.merge(
         existing_journal,

@@ -57,6 +57,22 @@ def _safe_str(value, default=""):
     except:
         return default
 
+def _normalize_trade_date(value):
+    """Normalise ANY Moomoo TradeDate (normal dd/m/yyyy OR expiry-leg ISO) -> dd/m/yyyy."""
+    s = str(value).strip().rstrip(",").strip()
+    if not s or s.lower() in ("nan", "none"):
+        return ""
+    if " " in s:
+        s = s.split(" ")[0]
+    if "T" in s:
+        s = s.split("T")[0]
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d/%m/%y", "%m/%d/%Y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return f"{dt.day}/{dt.month}/{dt.year}"
+        except ValueError:
+            continue
+    return s
 
 def _read_text(file_obj):
     file_obj.seek(0)
@@ -565,6 +581,10 @@ def parse_trades(file_obj, usd_to_sgd=None, hkd_to_sgd=None, snapshot_file=""):
 
     df = trades_df.copy()
 
+    # Normalise TradeDate so expiry/exercise ISO rows match normal dd/m/yyyy trades
+    if "TradeDate" in df.columns:
+        df["TradeDate"] = df["TradeDate"].apply(_normalize_trade_date)
+
     for col in UNIFIED_TRADES_COLS:
         if col not in df.columns:
             df[col] = ""
@@ -617,8 +637,13 @@ def save_trades_history(file_obj, usd_to_sgd=None, hkd_to_sgd=None, snapshot_fil
     else:
         existing_journal = pd.DataFrame(columns=key_cols + JOURNAL_COLS)
 
+    if snapshot_file and "SnapshotFile" in existing.columns:
+        existing = existing[existing["SnapshotFile"].astype(str) != str(snapshot_file)]
     combined = pd.concat([existing, new_trades], ignore_index=True)
-    combined = combined.drop_duplicates(subset=key_cols, keep="last")
+    combined["_snap"] = combined["SnapshotFile"].fillna("").astype(str) if "SnapshotFile" in combined.columns else ""
+    combined["_seq"] = combined.groupby(["_snap"] + key_cols).cumcount()
+    combined = combined.drop_duplicates(subset=key_cols + ["_seq"], keep="last")
+    combined = combined.drop(columns=["_seq", "_snap"], errors="ignore")
 
     combined = combined.merge(existing_journal, on=key_cols, how="left", suffixes=("", "_old"))
     for col in JOURNAL_COLS:
