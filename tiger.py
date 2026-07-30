@@ -172,34 +172,52 @@ def _activity_to_buy_sell(activity_type, quantity=None):
 
 def _normalize_trade_date(trade_time):
     """
-    Normalize Tiger trade time -> DD/MM/YYYY
-    to match Moomoo/IBKR format in trades_history.csv.
+    Normalize Tiger trade time/date into D/M/YYYY.
 
-    Tiger raw input examples:
-        '2026-07-14 10:21:18,'
-        '2026-07-14 10:21:18'
-        '2026-07-14'
+    Handles:
+    - 2026-07-14 10:21:18
+    - 2026-07-14, 10:21:18
+    - 2026-07-14
+    - 2026/07/14
+    - 14/7/2026
+    - 14/07/2026
     """
     s = str(trade_time).strip()
-    if s == "" or s.lower() == "nan":
+
+    if s == "" or s.lower() in ("nan", "none", "nat"):
         return ""
 
-    # Clean trailing commas + whitespace
+    # Remove quotes and surrounding whitespace
+    s = s.replace('"', "").replace("'", "").strip()
+
+    # Important: extract the first date-looking pattern from the raw value
+    # This protects against values like "2026-07-14, 10:21:18"
+    m = re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", s)
+    if m:
+        s = m.group(0)
+    else:
+        m = re.search(r"\d{1,2}[-/]\d{1,2}[-/]\d{4}", s)
+        if m:
+            s = m.group(0)
+
+    # Clean trailing junk again
     s = s.rstrip(",").strip()
 
-    # Drop time portion if present
-    if " " in s:
-        s = s.split(" ")[0]
+    formats = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%m/%d/%Y",
+    ]
 
-    # Try parsing ISO format first (Tiger's default)
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y"):
+    for fmt in formats:
         try:
             dt = datetime.strptime(s, fmt)
             return f"{dt.day}/{dt.month}/{dt.year}"
         except ValueError:
             continue
 
-    # Fallback: return as-is if unparseable
     return s
 
 
@@ -624,6 +642,14 @@ def _build_idx_map(header):
         except ValueError:
             return None
 
+    def find_any(names):
+        for name in names:
+            try:
+                return header.index(name)
+            except ValueError:
+                continue
+        return None
+
     return {
         "Symbol": find("Symbol"),
         "Symbol_Forex": find("Symbol(Base.Quote)"),
@@ -637,10 +663,9 @@ def _build_idx_map(header):
         "Platform Fee": find("Platform Fee"),
         "GST": find("GST"),
         "Realized P/L": find("Realized P/L"),
-        "Trade Time": find("Trade Time"),
+        "Trade Time": find_any(["Trade Time", "Trade Date", "Date/Time", "Date Time"]),
         "Currency": find("Currency"),
     }
-
 
 def parse_trades(file_obj, usd_to_sgd=None, snapshot_file=""):
     rows = _read_rows(file_obj)
@@ -702,7 +727,9 @@ def parse_trades(file_obj, usd_to_sgd=None, snapshot_file=""):
 
         trade_time = _safe_get(row, current_idx.get("Trade Time"))
         trade_date = _normalize_trade_date(trade_time)
-
+        if re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", str(trade_date).strip()):
+            trade_date = _normalize_trade_date(trade_date)
+            
         quantity = _to_float(_safe_get(row, current_idx.get("Quantity")))
         trade_price = _to_float(_safe_get(row, current_idx.get("Trade Price")))
         currency = _safe_get(row, current_idx.get("Currency")) or "USD"
