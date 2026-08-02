@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import json
 import re
 import pandas as pd
 from datetime import datetime, timedelta
@@ -80,26 +81,123 @@ def _gap_has_trading_day(start_date, end_date):
 # ============================================================
 # Constants
 # ============================================================
-DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "Welcome#123")
+ALLOWED_USERS = [
+    "garvill1230@gmail.com",
+]
+
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD")
+
+# One real account, multiple accepted usernames/aliases
+LOCAL_ACCOUNT = {
+    "usernames": ["edward", "garvill1230@gmail.com"],
+    "password": DASHBOARD_PASSWORD,
+    "user_id": "garvill1230@gmail.com",
+}
 
 if os.path.exists("/mnt/data"):
     DATA_DIR = "/mnt/data"
 else:
     DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
-SNAPSHOT_DIR = os.path.join(DATA_DIR, "snapshots")
-HISTORY_FILE = os.path.join(DATA_DIR, "portfolio_history.csv")
-INCOMING_DIR = os.path.join(DATA_DIR, "incoming")
 
-os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-os.makedirs(INCOMING_DIR, exist_ok=True)
+# ============================================================
+# USER ISOLATION
+# ============================================================
+
+def get_current_user():
+    """
+    Temporary.
+    Later this will come from Google OAuth.
+    """
+    return st.session_state.get("user_id", "edward")
 
 
+def get_user_dir():
+    return os.path.join(
+        DATA_DIR,
+        "users",
+        get_current_user()
+    )
+
+
+def get_snapshot_dir():
+    return os.path.join(
+        get_user_dir(),
+        "snapshots"
+    )
+
+
+def get_incoming_dir():
+    return os.path.join(
+        get_user_dir(),
+        "incoming"
+    )
+
+
+def get_history_file():
+    return os.path.join(
+        get_user_dir(),
+        "portfolio_history.csv"
+    )
+
+
+def get_trades_history_file():
+    return os.path.join(
+        get_user_dir(),
+        "trades_history.csv"
+    )
+
+
+def ensure_user_workspace():
+
+    os.makedirs(get_user_dir(), exist_ok=True)
+
+    os.makedirs(
+        get_snapshot_dir(),
+        exist_ok=True
+    )
+
+    os.makedirs(
+        get_incoming_dir(),
+        exist_ok=True
+    )
+
+def get_settings_file():
+    return os.path.join(get_user_dir(), "settings.json")
+
+
+def load_setting(key, default=None):
+    path = get_settings_file()
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return data.get(key, default)
+    except:
+        return default
+
+
+def save_setting(key, value):
+    path = get_settings_file()
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except:
+            data = {}
+    data[key] = value
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except:
+        pass
 # ============================================================
 # UNIFIED CONSTANTS (shared by IBKR / Tiger / Moomoo)
 # ============================================================
 
-TRADES_HISTORY_FILE = os.path.join(DATA_DIR, "trades_history.csv")
+
 
 INDEX_ETFS = ["CSPX", "VOO", "VT", "QQQ", "QQQM", "BNDW", "SPY", "DIA", "IWM"]
 
@@ -160,75 +258,174 @@ UNIFIED_HISTORY_COLS = [
 ]
 
 
-# ============================================================
-# PASSWORD — 全屏覆盖
-# ============================================================
-def check_password():
-    """只在 app.py 调用，全屏密码页面"""
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
-
-    if st.session_state["authenticated"]:
-        return True
-
-    st.markdown("""
-    <style>
-    [data-testid="stSidebar"] { display: none; }
-    header { display: none; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col2:
-        st.markdown("<div style='height:20vh'></div>", unsafe_allow_html=True)
-        st.markdown("## 📊 Portfolio Dashboard")
-        st.markdown("---")
-        password = st.text_input("🔒 请输入密码", type="password")
-
-        if password == "":
-            st.stop()
-
-        if password == DASHBOARD_PASSWORD:
-            st.session_state["authenticated"] = True
-            st.rerun()
-        else:
-            st.error("密码错误")
-            st.stop()
-
-
 def require_auth():
-    """子页面调用 — 未登录时显示密码框（不再要求跳 app 页）"""
-    if "authenticated" not in st.session_state:
-        st.session_state["authenticated"] = False
+    """子页面调用 — 未登录时显示登录选项（Google 或本地账号）"""
 
-    if st.session_state["authenticated"]:
+    # Already authenticated this session
+    if st.session_state.get("authenticated", False):
+        ensure_user_workspace()
+        render_logout_sidebar()
         return True
 
-    st.markdown("""
-    <style>
-    [data-testid="stSidebar"] { display: none; }
-    header { display: none; }
-    </style>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] { display: none; }
+        header { display: none; }
+
+        .gsi-material-button {
+            -webkit-appearance: none;
+            background-color: WHITE;
+            border: 1px solid #747775;
+            border-radius: 4px;
+            box-sizing: border-box;
+            color: #1f1f1f;
+            cursor: pointer;
+            font-family: 'Roboto', arial, sans-serif;
+            font-size: 14px;
+            height: 40px;
+            letter-spacing: 0.25px;
+            outline: none;
+            overflow: hidden;
+            padding: 0 12px;
+            position: relative;
+            text-align: center;
+            transition: background-color .218s, border-color .218s, box-shadow .218s;
+            vertical-align: middle;
+            white-space: nowrap;
+            width: 100%;
+            text-decoration: none;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .gsi-material-button:hover {
+            box-shadow: 0 1px 2px 0 rgba(60,64,67,.30), 0 1px 3px 1px rgba(60,64,67,.15);
+        }
+        .gsi-material-button-icon {
+            height: 20px;
+            width: 20px;
+            margin-right: 10px;
+        }
+        .gsi-material-button-contents {
+            font-weight: 500;
+            color: #1f1f1f;
+        }
+
+        .or-divider {
+            display: flex;
+            align-items: center;
+            text-align: center;
+            color: #9ca3af;
+            font-size: 13px;
+            margin: 18px 0;
+        }
+        .or-divider::before, .or-divider::after {
+            content: "";
+            flex: 1;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .or-divider:not(:empty)::before { margin-right: .75em; }
+        .or-divider:not(:empty)::after { margin-left: .75em; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     col1, col2, col3 = st.columns([1, 1, 1])
+
     with col2:
-        st.markdown("<div style='height:20vh'></div>", unsafe_allow_html=True)
+        st.markdown("<div style='height:15vh'></div>", unsafe_allow_html=True)
         st.markdown("## 📊 Portfolio Dashboard")
         st.markdown("---")
-        password = st.text_input("🔒 请输入密码", type="password", key="auth_pw_input")
 
-        if password == "":
+        st.markdown("#### Sign in")
+        st.caption("Get instant access")
+
+        google_html = (
+            '<a href="?login=true" target="_self" style="text-decoration:none;">'
+            '<button class="gsi-material-button" type="button">'
+            '<div class="gsi-material-button-icon">'
+            '<svg version="1.1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" style="display:block;">'
+            '<path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>'
+            '<path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>'
+            '<path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"></path>'
+            '<path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>'
+            '<path fill="none" d="M0 0h48v48H0z"></path>'
+            '</svg>'
+            '</div>'
+            '<span class="gsi-material-button-contents">Sign in with Google</span>'
+            '</button>'
+            '</a>'
+        )
+        st.markdown(google_html, unsafe_allow_html=True)
+
+        if st.query_params.get("login") == "true" and not st.user.is_logged_in:
+            st.login()
+
+        st.markdown('<div class="or-divider">or</div>', unsafe_allow_html=True)
+
+        username = st.text_input(
+            "Email or Username", key="local_username", label_visibility="collapsed",
+            placeholder="Email or Username",
+        )
+        password = st.text_input(
+            "Password", type="password", key="local_password", label_visibility="collapsed",
+            placeholder="Password",
+        )
+
+        if st.button("Sign in", width="stretch", key="local_login_btn", type="primary"):
+            if username.lower() in LOCAL_ACCOUNT["usernames"] and password == LOCAL_ACCOUNT["password"]:
+                st.session_state["authenticated"] = True
+                st.session_state["user_id"] = LOCAL_ACCOUNT["user_id"]
+                ensure_user_workspace()
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+
+    # ------------------------------------------------------------
+    # Handle Google login completing (user just came back from OAuth)
+    # ------------------------------------------------------------
+    if st.user.is_logged_in:
+        email = st.user.email.lower()
+
+        if email not in ALLOWED_USERS:
+            st.error(f"You are not authorised for beta access: {email}")
             st.stop()
 
-        if password == DASHBOARD_PASSWORD:
-            st.session_state["authenticated"] = True
+        st.session_state["authenticated"] = True
+        st.session_state["user_id"] = email
+        ensure_user_workspace()
+        st.rerun()
+
+    st.stop()
+
+
+    # st.user.is_logged_in is True at this point
+    email = st.user.email.lower()
+
+    if email not in ALLOWED_USERS:
+        st.error(f"🚫 {email} is not authorised for beta access.")
+        st.stop()
+
+    st.session_state["authenticated"] = True
+    st.session_state["user_id"] = email
+
+    ensure_user_workspace()
+
+    return True
+
+def render_logout_sidebar():
+    """Call this on every authenticated page to show user + logout button."""
+    with st.sidebar:
+        st.markdown("---")
+        st.caption(f"Logged in as: **{st.session_state.get('user_id', 'unknown')}**")
+        if st.button("Log out", width="stretch"):
+            if st.user.is_logged_in:
+                st.logout()
+            st.session_state["authenticated"] = False
+            st.session_state.pop("user_id", None)
             st.rerun()
-        else:
-            st.error("密码错误")
-            st.stop()
-
-
 # ============================================================
 # CSS
 # ============================================================
@@ -391,6 +588,17 @@ def format_df(df, cols_2dp=None, cols_3dp=None, date_cols=None):
             if c in out.columns:
                 out[c] = pd.to_numeric(out[c], errors="coerce").round(3)
 
+    # ⭐ Coerce leftover mixed-type object columns (e.g. Strike: float + "")
+    # to string so Streamlit/Arrow can serialize without warnings.
+    numeric_cols = set((cols_2dp or []) + (cols_3dp or []))
+    for c in out.columns:
+        if c in numeric_cols:
+            continue
+        if out[c].dtype == "object":
+            out[c] = out[c].astype(str).replace(
+                {"nan": "", "None": "", "NaT": ""}
+            )
+
     return out
 
 
@@ -420,7 +628,83 @@ def detect_platform(file_bytes):
 
     return None
 
+def delete_snapshot(platform, snapshot_name):
+    """
+    Shared delete used by Overview sidebar + Snapshot Manager.
+    Removes the row from portfolio_history.csv, its rows from
+    trades_history.csv, and the physical snapshot file.
+    """
+    # Remove from portfolio_history.csv
+    if os.path.exists(get_history_file()):
+        try:
+            hdf = pd.read_csv(get_history_file())
+            if not hdf.empty and "Platform" in hdf.columns and "SnapshotFile" in hdf.columns:
+                mask = ~(
+                    (hdf["Platform"].astype(str) == platform)
+                    & (hdf["SnapshotFile"].astype(str) == snapshot_name)
+                )
+                hdf[mask].to_csv(get_history_file(), index=False)
+        except:
+            pass
 
+    # Remove from trades_history.csv
+    if os.path.exists(get_trades_history_file()):
+        try:
+            tdf = pd.read_csv(get_trades_history_file(), dtype=str)
+            if not tdf.empty and "Platform" in tdf.columns and "SnapshotFile" in tdf.columns:
+                mask = ~(
+                    (tdf["Platform"].astype(str) == platform)
+                    & (tdf["SnapshotFile"].astype(str) == snapshot_name)
+                )
+                tdf[mask].to_csv(get_trades_history_file(), index=False)
+        except:
+            pass
+
+    # Remove physical snapshot file (lazy import to avoid circular import)
+    try:
+        if platform == "IBKR":
+            from ibkr import get_ibkr_snapshot_dir as _dirfn
+        elif platform == "Tiger":
+            from tiger import get_tiger_snapshot_dir as _dirfn
+        elif platform == "Moomoo":
+            from moomoo import get_moomoo_snapshot_dir as _dirfn
+        else:
+            _dirfn = None
+
+        if _dirfn is not None:
+            snap_path = os.path.join(_dirfn(), snapshot_name)
+            if os.path.exists(snap_path):
+                os.remove(snap_path)
+    except:
+        pass
+
+def _existing_snapshot_files(platform):
+    if not os.path.exists(get_history_file()):
+        return set()
+    try:
+        df = pd.read_csv(get_history_file())
+    except:
+        return set()
+    if df.empty or "Platform" not in df.columns or "SnapshotFile" not in df.columns:
+        return set()
+    sub = df[df["Platform"].astype(str) == platform]
+    return set(sub["SnapshotFile"].astype(str))
+
+
+def _find_overlap(new_snapshot_name, other_files):
+    ns, ne = _extract_dates_from_filename(new_snapshot_name)
+    if ns is None or ne is None:
+        return None
+    for other in other_files:
+        if other == new_snapshot_name:
+            continue
+        os_, oe_ = _extract_dates_from_filename(other)
+        if os_ is None or oe_ is None:
+            continue
+        overlap_days = (min(ne, oe_) - max(ns, os_)).days + 1
+        if overlap_days >= 2:
+            return other
+    return None
 # ============================================================
 # COVERAGE / GAP DETECTION
 # (Reads from portfolio_history.csv SnapshotFile names)
@@ -487,11 +771,11 @@ def detect_coverage_gaps(platform):
         "covered_days": 0,
     }
 
-    if not os.path.exists(HISTORY_FILE):
+    if not os.path.exists(get_history_file()):
         return result
 
     try:
-        df = pd.read_csv(HISTORY_FILE)
+        df = pd.read_csv(get_history_file())
     except:
         return result
 
@@ -580,37 +864,9 @@ def detect_coverage_gaps(platform):
     return result
 
 
-def get_coverage_summary(platform):
-    """Human-readable summary for dashboard display."""
-    info = detect_coverage_gaps(platform)
-    lines = []
-
-    if not info["ranges"]:
-        return f"⚠️ 没有 {platform} statement coverage 记录。"
-
-    lines.append(f"📅 {platform} 已上传 {len(info['ranges'])} 份 statement")
-    lines.append(f"   覆盖 {info['covered_days']} / {info['total_days']} 交易日")
-
-    if info["gaps"]:
-        lines.append(f"\n⚠️ 检测到 {len(info['gaps'])} 个日期缺口：")
-        for gs, ge in info["gaps"]:
-            lines.append(f"   • {gs} → {ge}")
-        lines.append("\n👉 建议补一份覆盖这段时间的 statement，否则 FIFO 可能不准。")
-    else:
-        lines.append("✅ 没有日期缺口，FIFO 计算可信。")
-
-    if info["overlaps"]:
-        lines.append(f"\nℹ️ 有 {len(info['overlaps'])} 个重叠区间（不影响，已去重）：")
-        for os_, oe in info["overlaps"][:5]:
-            lines.append(f"   • {os_} → {oe}")
-
-    return "\n".join(lines)
-
-
 # ============================================================
 # 主入口 — 登录后跳转 Overview
 # ============================================================
-# 只有直接跑 app.py 时才执行，被 import 时不执行
 if __name__ == "__main__":
-    check_password()
+    require_auth()
     st.switch_page("pages/1_Overview.py")

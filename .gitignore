@@ -10,7 +10,7 @@ app.cpython-313.pyc
 ibkr.cpython-313.pyc
 # Streamlit
 .streamlit/secrets.toml
-
+.streamlit/secrets.toml2
 # Data / sensitive
 data/
 *.csv
@@ -33,3 +33,7 @@ Thumbs.db
 *.key
 
 .gloudignore
+google_credential.json
+test_oauth.py
+repair_dates.py
+*.bak

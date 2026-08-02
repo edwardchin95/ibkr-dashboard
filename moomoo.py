@@ -6,8 +6,8 @@ import csv as _csv
 from datetime import datetime, timedelta
 
 from app import (
-    SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR,
-    TRADES_HISTORY_FILE,
+    get_snapshot_dir, get_history_file, get_incoming_dir,
+    get_trades_history_file,
     INDEX_ETFS,
     TARGET_ETF_STOCK_TOTAL, TARGET_SINGLE_STOCK,
     TARGET_OPTION_TOTAL, TARGET_CASH,
@@ -23,8 +23,14 @@ from app import (
 # Moomoo-specific Constants
 # ============================================================
 
-MOOMOO_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "moomoo")
-os.makedirs(MOOMOO_SNAPSHOT_DIR, exist_ok=True)
+def get_moomoo_snapshot_dir():
+    path = os.path.join(get_snapshot_dir(), "moomoo")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+# Alias for backward compatibility
+MOOMOO_SNAPSHOT_DIR = get_moomoo_snapshot_dir()
 
 # ⭐ How many days after statement's end_date we still consider its
 # [Account Overview] snapshot to be "fresh"
@@ -612,9 +618,9 @@ def save_trades_history(file_obj, usd_to_sgd=None, hkd_to_sgd=None, snapshot_fil
     if new_trades.empty:
         return load_trades_history()
 
-    if os.path.exists(TRADES_HISTORY_FILE):
+    if os.path.exists(get_trades_history_file()):
         try:
-            existing = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+            existing = pd.read_csv(get_trades_history_file(), dtype=str)
         except:
             existing = pd.DataFrame()
     else:
@@ -667,16 +673,16 @@ def save_trades_history(file_obj, usd_to_sgd=None, hkd_to_sgd=None, snapshot_fil
         )
         combined = combined.drop(columns=["_sort_date"])
 
-    combined.to_csv(TRADES_HISTORY_FILE, index=False)
+    combined.to_csv(get_trades_history_file(), index=False)
     return load_trades_history()
 
 
 def load_trades_history():
-    if not os.path.exists(TRADES_HISTORY_FILE):
+    if not os.path.exists(get_trades_history_file()):
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
 
     try:
-        df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        df = pd.read_csv(get_trades_history_file(), dtype=str)
     except:
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
 
@@ -884,12 +890,12 @@ def save_snapshot_and_history(uploaded_file, *_args):
 
     if fd and ld:
         snapshot_filename = f"moomoo_statement({fd}-{ld}){ext_part}"
-        timestamp = f"{ld[:4]}-{ld[4:6]}-{ld[6:8]}"
+        timestamp = f"{int(ld[6:8])}/{int(ld[4:6])}/{ld[:4]}"
     else:
         snapshot_filename = f"{name_part}_{upload_time}{ext_part}"
         timestamp = upload_time
 
-    snapshot_path = os.path.join(MOOMOO_SNAPSHOT_DIR, snapshot_filename)
+    snapshot_path = os.path.join(get_moomoo_snapshot_dir(), snapshot_filename)
     uploaded_file.seek(0)
     with open(snapshot_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -907,9 +913,9 @@ def save_snapshot_and_history(uploaded_file, *_args):
     withdrawal = cs["withdrawals"]
     other = cs["other"]
 
-    if os.path.exists(HISTORY_FILE):
+    if os.path.exists(get_history_file()):
         try:
-            history_df = pd.read_csv(HISTORY_FILE)
+            history_df = pd.read_csv(get_history_file())
         except:
             history_df = pd.DataFrame()
     else:
@@ -944,7 +950,7 @@ def save_snapshot_and_history(uploaded_file, *_args):
 
     history_df = _recompute_cumulative(history_df, "Moomoo")
 
-    history_df.to_csv(HISTORY_FILE, index=False)
+    history_df.to_csv(get_history_file(), index=False)
 
     uploaded_file.seek(0)
     save_trades_history(uploaded_file, usd_to_sgd=usd_to_sgd, hkd_to_sgd=hkd_to_sgd, snapshot_file=snapshot_filename)
@@ -969,16 +975,16 @@ def compute_cumulative_others_breakdown():
         "misc_other": 0.0,
     }
 
-    if not os.path.exists(MOOMOO_SNAPSHOT_DIR):
+    if not os.path.exists(get_moomoo_snapshot_dir()):
         return result
 
     snapshot_files = [
-        f for f in os.listdir(MOOMOO_SNAPSHOT_DIR)
+        f for f in os.listdir(get_moomoo_snapshot_dir())
         if f.lower().endswith(".csv")
     ]
 
     for f in snapshot_files:
-        snapshot_path = os.path.join(MOOMOO_SNAPSHOT_DIR, f)
+        snapshot_path = os.path.join(get_moomoo_snapshot_dir(), f)
         try:
             with open(snapshot_path, "rb") as fh:
                 fake_upload = io.BytesIO(fh.read())
@@ -999,11 +1005,11 @@ def compute_cumulative_others_breakdown():
 # ============================================================
 
 def load_latest_snapshot():
-    if not os.path.exists(HISTORY_FILE):
+    if not os.path.exists(get_history_file()):
         return None
 
     try:
-        history_df = pd.read_csv(HISTORY_FILE)
+        history_df = pd.read_csv(get_history_file())
     except:
         return None
 
@@ -1033,9 +1039,9 @@ def load_latest_snapshot():
     latest = moo_df.iloc[-1]
     snapshot_file = latest["SnapshotFile"]
 
-    snapshot_path = os.path.join(MOOMOO_SNAPSHOT_DIR, snapshot_file)
+    snapshot_path = os.path.join(get_moomoo_snapshot_dir(), snapshot_file)
     if not os.path.exists(snapshot_path):
-        legacy = os.path.join(SNAPSHOT_DIR, snapshot_file)
+        legacy = os.path.join(get_snapshot_dir(), snapshot_file)
         if os.path.exists(legacy):
             snapshot_path = legacy
         else:
@@ -1076,27 +1082,27 @@ def load_latest_snapshot():
 # ============================================================
 
 def process_incoming():
-    if not os.path.exists(INCOMING_DIR):
+    if not os.path.exists(get_incoming_dir()):
         return
 
     incoming_files = sorted([
-        f for f in os.listdir(INCOMING_DIR)
+        f for f in os.listdir(get_incoming_dir())
         if f.lower().endswith(".csv")
     ])
 
     if len(incoming_files) == 0:
         return
 
-    if os.path.exists(HISTORY_FILE):
+    if os.path.exists(get_history_file()):
         try:
-            history_df = pd.read_csv(HISTORY_FILE)
+            history_df = pd.read_csv(get_history_file())
         except:
             history_df = pd.DataFrame()
     else:
         history_df = pd.DataFrame()
 
     for f in incoming_files:
-        incoming_path = os.path.join(INCOMING_DIR, f)
+        incoming_path = os.path.join(get_incoming_dir(), f)
 
         with open(incoming_path, "rb") as fh:
             raw = fh.read()
@@ -1137,7 +1143,7 @@ def process_incoming():
 
         if fd and ld:
             new_name = f"moomoo_statement({fd}-{ld}).csv"
-            timestamp = f"{ld[:4]}-{ld[4:6]}-{ld[6:8]}"
+            timestamp = f"{int(ld[6:8])}/{int(ld[4:6])}/{ld[:4]}"
         else:
             new_name = f
             timestamp = f.replace("moomoo_statement_", "").replace(".csv", "")
@@ -1173,7 +1179,7 @@ def process_incoming():
 
         history_df = pd.concat([history_df, new_row], ignore_index=True)
 
-        snapshot_path = os.path.join(MOOMOO_SNAPSHOT_DIR, new_name)
+        snapshot_path = os.path.join(get_moomoo_snapshot_dir(), new_name)
         os.rename(incoming_path, snapshot_path)
 
     if "SnapshotFile" in history_df.columns and "Platform" in history_df.columns:
@@ -1183,7 +1189,7 @@ def process_incoming():
 
     history_df = _recompute_cumulative(history_df, "Moomoo")
 
-    history_df.to_csv(HISTORY_FILE, index=False)
+    history_df.to_csv(get_history_file(), index=False)
 
 
 # ============================================================
@@ -1331,11 +1337,11 @@ def load_cash_summary_total_sgd():
         "fees": 0, "deposits": 0, "withdrawals": 0, "other": 0,
     }
 
-    if not os.path.exists(HISTORY_FILE):
+    if not os.path.exists(get_history_file()):
         return default
 
     try:
-        df = pd.read_csv(HISTORY_FILE)
+        df = pd.read_csv(get_history_file())
     except:
         return default
 

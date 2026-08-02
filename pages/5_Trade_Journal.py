@@ -10,8 +10,8 @@ from collections import defaultdict
 st.set_page_config(page_title="Trade Journal", page_icon="📝", layout="wide")
 
 from app import (
-    require_auth, load_css, DATA_DIR,
-    TRADES_HISTORY_FILE,
+    require_auth, load_css,  get_user_dir,
+    get_trades_history_file,
 )
 
 # --- DTE anchored to US market close (16:00 ET) ---
@@ -116,7 +116,7 @@ st.caption("Notes, plans, campaign tracking. Independent of broker imports.")
 # CONFIG
 # ============================================================
 
-TRADE_JOURNAL_FILE = os.path.join(DATA_DIR, "trade_journal.csv")
+TRADE_JOURNAL_FILE = os.path.join(get_user_dir(), "trade_journal.csv")
 
 JOURNAL_SCHEMA = ["JournalId", "CreatedAt", "Date", "Tags", "Notes", "Breakeven"]
 
@@ -468,7 +468,7 @@ def _get_journal_mtime():
 
 
 def _get_trades_mtime():
-    return os.path.getmtime(TRADES_HISTORY_FILE) if os.path.exists(TRADES_HISTORY_FILE) else 0
+    return os.path.getmtime(get_trades_history_file()) if os.path.exists(get_trades_history_file()) else 0
 
 
 @st.cache_data(ttl=300)
@@ -494,10 +494,10 @@ def _load_journal(mtime):
 
 @st.cache_data(ttl=300)
 def _load_trades(mtime):
-    if not os.path.exists(TRADES_HISTORY_FILE):
+    if not os.path.exists(get_trades_history_file()):
         return pd.DataFrame()
     try:
-        return pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        return pd.read_csv(get_trades_history_file(), dtype=str)
     except Exception:
         return pd.DataFrame()
 
@@ -1085,14 +1085,14 @@ def _render_campaign(c, nested=False):
             # Action buttons
             for i, (emoji, pending_key, tooltip) in enumerate(actions):
                 with head_cols[i + 1]:
-                    if st.button(emoji, key=f"{pending_key}_{c['group']}", use_container_width=True, help=tooltip):
+                    if st.button(emoji, key=f"{pending_key}_{c['group']}", width="stretch", help=tooltip):
                         st.session_state[pending_key] = c["group"]
                         st.rerun()
             # Timeline toggle (always last)
             with head_cols[-1]:
                 tl_icon = "📖" if is_tl_open else "📜"
                 tl_help = f"{c['n_trades']} trades / {c['n_notes']} notes — click to {'hide' if is_tl_open else 'view'} timeline"
-                if st.button(tl_icon, key=tl_key, use_container_width=True, help=tl_help):
+                if st.button(tl_icon, key=tl_key, width="stretch", help=tl_help):
                     st.session_state["_open_timeline"] = None if is_tl_open else c["group"]
                     st.rerun()
 
@@ -1333,7 +1333,7 @@ def _add_entry_dialog():
         with action_col:
             if selected_count >= 2:
                 if st.button(f"📋 Combine ({selected_count})", type="primary",
-                             use_container_width=True, key="combine_btn_top"):
+                             width="stretch", key="combine_btn_top"):
                     selected_trades_data = []
                     for i, (_, r) in enumerate(matching.head(10).iterrows()):
                         if st.session_state.get(f"trade_check_{i}", False):
@@ -1513,7 +1513,7 @@ def _add_entry_dialog():
     st.markdown("---")
     c1, c2 = st.columns(2)
 
-    if c1.button("✅ Save", type="primary", use_container_width=True):
+    if c1.button("✅ Save", type="primary", width="stretch"):
         if not notes.strip():
             st.error("Notes field cannot be empty.")
             return
@@ -1543,7 +1543,7 @@ def _add_entry_dialog():
 
         new_row = {
             "JournalId": str(uuid.uuid4()),
-            "CreatedAt": date.today().strftime("%d/%m/%Y"),
+            "CreatedAt": f"{date.today().day}/{date.today().month}/{date.today().year}",
             "Date": parsed_date,
             "Tags": _join_tags(parsed_tags),
             "Notes": notes.strip(),
@@ -1562,7 +1562,7 @@ def _add_entry_dialog():
         st.cache_data.clear()
         st.rerun()
 
-    if c2.button("❌ Cancel", use_container_width=True):
+    if c2.button("❌ Cancel", width="stretch"):
         for k in ["dialog_date", "dialog_campaign_ms", "dialog_new_campaign",
                   "dialog_desc_tags", "dialog_strategy", "dialog_notes", "dialog_be"]:
             st.session_state.pop(k, None)
@@ -1583,7 +1583,7 @@ if st.session_state.pop("_reopen_add_dialog", False):
 # ============================================================
 
 top_c1, _ = st.columns([2, 6])
-if top_c1.button("➕ Add Journal Entry", use_container_width=True, type="primary"):
+if top_c1.button("➕ Add Journal Entry", width="stretch", type="primary"):
     _add_entry_dialog()
 
 _render_naming_help()
@@ -1771,7 +1771,7 @@ else:
 
             assign_editor_key = "assign_trades_editor"
             edited_assign_df = st.data_editor(
-                editor_df_assign.head(100), use_container_width=True, hide_index=True,
+                editor_df_assign.head(100), width="stretch", hide_index=True,
                 disabled=[c for c in editor_df_assign.columns if c != "Group"],
                 key=assign_editor_key,
                 column_config={
@@ -1784,7 +1784,7 @@ else:
 
             ignore_col, save_col = st.columns([1, 1])
 
-            if ignore_col.button("🚫 Mark visible blank rows as _ignore", use_container_width=True,
+            if ignore_col.button("🚫 Mark visible blank rows as _ignore", width="stretch",
                                  type="secondary", key="bulk_ignore"):
                 try:
                     state = st.session_state.get(assign_editor_key, None)
@@ -1798,7 +1798,7 @@ else:
                             for col, value in changes.items():
                                 if col in working_df.columns and row_pos < len(working_df):
                                     working_df.iloc[row_pos, working_df.columns.get_loc(col)] = value
-                    full_trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+                    full_trades = pd.read_csv(get_trades_history_file(), dtype=str)
                     if "Group" not in full_trades.columns:
                         full_trades["Group"] = ""
                     key_cols = ["Platform", "TradeDate", "Symbol", "Buy/Sell", "Quantity", "TradePrice", "NetCash"]
@@ -1819,14 +1819,14 @@ else:
                         mask = full_trades["_TradeKey"].isin(blank_keys)
                         full_trades.loc[mask, "Group"] = "_ignore"
                         full_trades = full_trades.drop(columns=["_TradeKey"], errors="ignore")
-                        full_trades.to_csv(TRADES_HISTORY_FILE, index=False)
+                        full_trades.to_csv(get_trades_history_file(), index=False)
                         st.success(f"✅ Marked {len(blank_keys)} trades as `_ignore`.")
                         st.cache_data.clear()
                         st.rerun()
                 except Exception as e:
                     st.error(f"Failed: {e}")
 
-            if save_col.button("💾 Save Group Assignments", use_container_width=True,
+            if save_col.button("💾 Save Group Assignments", width="stretch",
                                type="primary", key="save_assignments"):
                 try:
                     state = st.session_state.get(assign_editor_key, None)
@@ -1840,7 +1840,7 @@ else:
                             for col, value in changes.items():
                                 if col in edited_assign_df.columns and row_pos < len(edited_assign_df):
                                     edited_assign_df.iloc[row_pos, edited_assign_df.columns.get_loc(col)] = value
-                    full_trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+                    full_trades = pd.read_csv(get_trades_history_file(), dtype=str)
                     if "Group" not in full_trades.columns:
                         full_trades["Group"] = ""
                     key_cols = ["Platform", "TradeDate", "Symbol", "Buy/Sell", "Quantity", "TradePrice", "NetCash"]
@@ -1861,7 +1861,7 @@ else:
                         full_trades["Group"] = full_trades["Group_new"].combine_first(full_trades["Group"])
                         full_trades.drop(columns=["Group_new"], inplace=True)
                     full_trades = full_trades.drop(columns=["_TradeKey"], errors="ignore")
-                    full_trades.to_csv(TRADES_HISTORY_FILE, index=False)
+                    full_trades.to_csv(get_trades_history_file(), index=False)
                     st.success("✅ Group assignments saved.")
                     st.cache_data.clear()
                     st.rerun()
@@ -1913,7 +1913,7 @@ else:
         editor_key = "trade_journal_editor"
 
         edited_df = st.data_editor(
-            editor_df, use_container_width=True, hide_index=True,
+            editor_df, width="stretch", hide_index=True,
             disabled=["CreatedAt", "JournalId"], key=editor_key,
             column_config={
                 "Select": st.column_config.CheckboxColumn("🗑", help="Check to mark for delete", default=False, width="small"),
@@ -1928,7 +1928,7 @@ else:
 
         col_save, col_delete = st.columns([1, 1])
 
-        if col_save.button("💾 Save Changes", use_container_width=True, type="primary"):
+        if col_save.button("💾 Save Changes", width="stretch", type="primary"):
             try:
                 state = st.session_state.get(editor_key, None)
                 if isinstance(state, dict) and "edited_rows" in state:
@@ -1964,7 +1964,7 @@ else:
             except Exception as e:
                 st.error(f"Save failed: {e}")
 
-        if col_delete.button("🗑️ Delete Checked Entries", use_container_width=True, type="secondary"):
+        if col_delete.button("🗑️ Delete Checked Entries", width="stretch", type="secondary"):
             state = st.session_state.get(editor_key, None)
             select_map = {}
             if isinstance(state, dict) and "edited_rows" in state:
@@ -2012,7 +2012,7 @@ def _confirm_delete_dialog(pending):
     st.markdown(preview_html, unsafe_allow_html=True)
     st.markdown("---")
     c1, c2 = st.columns(2)
-    if c1.button("✅ Yes, Delete", type="primary", use_container_width=True):
+    if c1.button("✅ Yes, Delete", type="primary", width="stretch"):
         try:
             ids_to_delete = [jid for jid, _ in pending]
             full_df = pd.read_csv(TRADE_JOURNAL_FILE, dtype=str)
@@ -2024,7 +2024,7 @@ def _confirm_delete_dialog(pending):
             st.rerun()
         except Exception as e:
             st.error(f"Delete failed: {e}")
-    if c2.button("❌ Cancel", use_container_width=True):
+    if c2.button("❌ Cancel", width="stretch"):
         st.session_state.pop("_pending_delete_ids", None)
         st.rerun()
 
@@ -2042,7 +2042,7 @@ def _close_cycle_dialog(campaign_name):
         f"premium will flow to the parent's Adjusted Cost."
     )
     try:
-        trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        trades = pd.read_csv(get_trades_history_file(), dtype=str)
     except Exception:
         st.error("Failed to read trades_history.csv")
         return
@@ -2059,7 +2059,7 @@ def _close_cycle_dialog(campaign_name):
     if affected.empty:
         st.warning(f"No shared trades for `{campaign_name}`. Nothing to untag.")
         st.markdown("---")
-        if st.button("❌ OK", use_container_width=True):
+        if st.button("❌ OK", width="stretch"):
             st.session_state.pop("_pending_close_cycle", None)
             st.rerun()
         return
@@ -2085,9 +2085,9 @@ def _close_cycle_dialog(campaign_name):
     st.markdown(preview_html, unsafe_allow_html=True)
     st.markdown("---")
     c1, c2 = st.columns(2)
-    if c1.button("✅ Yes, Close Cycle", type="primary", use_container_width=True):
+    if c1.button("✅ Yes, Close Cycle", type="primary", width="stretch"):
         try:
-            full_trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+            full_trades = pd.read_csv(get_trades_history_file(), dtype=str)
             if "Group" not in full_trades.columns:
                 full_trades["Group"] = ""
 
@@ -2100,14 +2100,14 @@ def _close_cycle_dialog(campaign_name):
                 return ",".join([g for g in groups if g != campaign_name])
 
             full_trades["Group"] = full_trades["Group"].fillna("").apply(_untag)
-            full_trades.to_csv(TRADES_HISTORY_FILE, index=False)
+            full_trades.to_csv(get_trades_history_file(), index=False)
             st.session_state.pop("_pending_close_cycle", None)
             st.success(f"✅ Closed `{campaign_name}`. {len(affected)} trade(s) untagged.")
             st.cache_data.clear()
             st.rerun()
         except Exception as e:
             st.error(f"Failed: {e}")
-    if c2.button("❌ Cancel", use_container_width=True):
+    if c2.button("❌ Cancel", width="stretch"):
         st.session_state.pop("_pending_close_cycle", None)
         st.rerun()
 
@@ -2124,7 +2124,7 @@ def _mark_expired_dialog(campaign_name):
         "position nets flat and moves to closed. Your premium and realized stats are PRESERVED."
     )
     try:
-        trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        trades = pd.read_csv(get_trades_history_file(), dtype=str)
     except Exception:
         st.error("Failed to read trades_history.csv")
         return
@@ -2138,7 +2138,7 @@ def _mark_expired_dialog(campaign_name):
     ct = trades[mask].copy()
     if ct.empty:
         st.warning(f"No trades tagged `{campaign_name}`.")
-        if st.button("❌ OK", use_container_width=True):
+        if st.button("❌ OK", width="stretch"):
             st.session_state.pop("_pending_mark_expired", None)
             st.rerun()
         return
@@ -2157,7 +2157,7 @@ def _mark_expired_dialog(campaign_name):
 
     if not open_legs:
         st.info(f"`{campaign_name}` is already flat (no open legs). Nothing to close.")
-        if st.button("❌ OK", use_container_width=True):
+        if st.button("❌ OK", width="stretch"):
             st.session_state.pop("_pending_mark_expired", None)
             st.rerun()
         return
@@ -2176,9 +2176,9 @@ def _mark_expired_dialog(campaign_name):
     st.markdown(preview_html, unsafe_allow_html=True)
     st.markdown("---")
     c1, c2 = st.columns(2)
-    if c1.button("✅ Yes, Mark Expired", type="primary", use_container_width=True):
+    if c1.button("✅ Yes, Mark Expired", type="primary", width="stretch"):
         try:
-            full_trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+            full_trades = pd.read_csv(get_trades_history_file(), dtype=str)
             today_str = date.today().strftime("%d/%m/%Y")
             new_rows = []
             for template, net in open_legs:
@@ -2197,14 +2197,14 @@ def _mark_expired_dialog(campaign_name):
                         row[rc] = "0"
                 new_rows.append(row)
             full_trades = pd.concat([full_trades, pd.DataFrame(new_rows)], ignore_index=True)
-            full_trades.to_csv(TRADES_HISTORY_FILE, index=False)
+            full_trades.to_csv(get_trades_history_file(), index=False)
             st.session_state.pop("_pending_mark_expired", None)
             st.success(f"✅ Marked `{campaign_name}` expired. {len(new_rows)} closing leg(s) added. Premium preserved.")
             st.cache_data.clear()
             st.rerun()
         except Exception as e:
             st.error(f"Failed: {e}")
-    if c2.button("❌ Cancel", use_container_width=True):
+    if c2.button("❌ Cancel", width="stretch"):
         st.session_state.pop("_pending_mark_expired", None)
         st.rerun()
 
@@ -2223,9 +2223,9 @@ def _force_close_dialog(campaign_name):
         f"For a normal expiry, use 🏁 Mark Expired instead (keeps your premium)."
     )
     c1, c2 = st.columns(2)
-    if c1.button("✅ Yes, Force Close", type="primary", use_container_width=True):
+    if c1.button("✅ Yes, Force Close", type="primary", width="stretch"):
         try:
-            full_trades = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+            full_trades = pd.read_csv(get_trades_history_file(), dtype=str)
             if "Group" not in full_trades.columns:
                 full_trades["Group"] = ""
 
@@ -2245,14 +2245,14 @@ def _force_close_dialog(campaign_name):
                 if new != old:
                     full_trades.at[idx, "Group"] = new
                     n_affected += 1
-            full_trades.to_csv(TRADES_HISTORY_FILE, index=False)
+            full_trades.to_csv(get_trades_history_file(), index=False)
             st.session_state.pop("_pending_force_close", None)
             st.success(f"✅ Force-closed `{campaign_name}`. {n_affected} trade(s) updated.")
             st.cache_data.clear()
             st.rerun()
         except Exception as e:
             st.error(f"Failed: {e}")
-    if c2.button("❌ Cancel", use_container_width=True):
+    if c2.button("❌ Cancel", width="stretch"):
         st.session_state.pop("_pending_force_close", None)
         st.rerun()
 

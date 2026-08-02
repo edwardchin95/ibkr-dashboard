@@ -2,12 +2,13 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import os
+import re
 import yfinance as yf
 
 st.set_page_config(page_title="Overview", page_icon="📊", layout="wide")
 
 from app import (
-    require_auth, load_css, detect_platform, HISTORY_FILE, format_df,
+    require_auth, load_css, detect_platform, get_history_file, format_df,_existing_snapshot_files, _find_overlap,load_setting, save_setting,
     TARGET_ETF_STOCK_TOTAL, TARGET_SINGLE_STOCK,
     TARGET_OPTION_TOTAL, TARGET_CASH,
     OPTION_TARGETS, OPTION_COLORS,
@@ -43,7 +44,7 @@ from moomoo import (
 )
 
 # ============================================================
-# 验证 + CSS
+# Auth + CSS
 # ============================================================
 require_auth()
 load_css()
@@ -58,74 +59,83 @@ moomoo_process_incoming()
 # ============================================================
 # SIDEBAR
 # ============================================================
-st.sidebar.title("📁 数据上传")
+st.sidebar.title("📤 Upload Statements")
+
+if "ov_uploader_key" not in st.session_state:
+    st.session_state["ov_uploader_key"] = 0
 
 uploaded_file = st.sidebar.file_uploader(
-    "上传 CSV（自动识别平台）",
+    "Upload statement CSV files",
     type="csv",
-    key="overview_upload"
+    key=f"overview_upload_{st.session_state['ov_uploader_key']}",
+    help="IBKR, Tiger and Moomoo CSV statements are supported. Files are processed automatically."
 )
 
 platform_filter = st.sidebar.selectbox(
-    "🔍 平台筛选",
+    "🔍 Platform Filter",
     ["All", "IBKR", "Tiger", "Moomoo"],
     index=0,
     key="platform_filter"
 )
 
 target_nav = st.sidebar.number_input(
-    "🎯 目标净值 SGD",
-    value=100000,
-    step=10000
+    "🎯 Target NAV (SGD)",
+    value=int(load_setting("target_nav", 100000)),
+    step=10000,
+    key="target_nav_input",
 )
 
-st.sidebar.info(
-    "✅ 自动识别平台\n"
-    "• IBKR Flex Query CSV\n"
-    "• Tiger Activity Statement CSV\n"
-    "• Moomoo Statement CSV"
-)
+# Persist to disk whenever it changes (survives refresh / new session)
+if target_nav != load_setting("target_nav", 100000):
+    save_setting("target_nav", int(target_nav))
 
 # ============================================================
-# UPLOAD HANDLER
+# UPLOAD HANDLER (light — full management in Snapshot Manager)
 # ============================================================
 if uploaded_file is not None:
 
-    file_bytes = uploaded_file.getvalue()
-    platform = detect_platform(file_bytes)
+    raw = uploaded_file.getvalue()
+    platform = detect_platform(raw)
 
-    if platform == "IBKR":
-        uploaded_file.seek(0)
-        ibkr_total_nav, ibkr_cash_v, _, _ = ibkr_extract_nav_cash(uploaded_file)
-
-        uploaded_file.seek(0)
-        ibkr_pnl_v = ibkr_extract_total_pnl(uploaded_file)
-
-        uploaded_file.seek(0)
-        ibkr_deposit_raw = ibkr_extract_total_deposit(uploaded_file)
-
-        uploaded_file.seek(0)
-        ibkr_save_snapshot_and_history(
-            uploaded_file, ibkr_total_nav, ibkr_cash_v, ibkr_pnl_v, ibkr_deposit_raw
-        )
-
-        st.sidebar.success("✅ IBKR 数据已更新")
-        st.cache_data.clear()
-
-    elif platform == "Tiger":
-        uploaded_file.seek(0)
-        tiger_save_snapshot_and_history(uploaded_file)
-        st.sidebar.success("✅ Tiger 数据已更新")
-        st.cache_data.clear()
-
-    elif platform == "Moomoo":
-        uploaded_file.seek(0)
-        moomoo_save_snapshot_and_history(uploaded_file)
-        st.sidebar.success("✅ Moomoo 数据已更新")
-        st.cache_data.clear()
-
+    if platform not in ("IBKR", "Tiger", "Moomoo"):
+        st.sidebar.error("❌ Unsupported format")
     else:
-        st.sidebar.error("❌ 无法识别此文件属于哪个平台")
+        before = _existing_snapshot_files(platform)
+
+        if platform == "IBKR":
+            uploaded_file.seek(0); nav, cash, _, _ = ibkr_extract_nav_cash(uploaded_file)
+            uploaded_file.seek(0); pnl = ibkr_extract_total_pnl(uploaded_file)
+            uploaded_file.seek(0); dep = ibkr_extract_total_deposit(uploaded_file)
+            uploaded_file.seek(0); ibkr_save_snapshot_and_history(uploaded_file, nav, cash, pnl, dep)
+        elif platform == "Tiger":
+            uploaded_file.seek(0); tiger_save_snapshot_and_history(uploaded_file)
+        elif platform == "Moomoo":
+            uploaded_file.seek(0); moomoo_save_snapshot_and_history(uploaded_file)
+
+        after = _existing_snapshot_files(platform)
+        new_files = after - before
+
+        if new_files:
+            new_name = sorted(new_files)[0]
+            overlap_with = _find_overlap(new_name, before)
+
+            if overlap_with:
+                from app import delete_snapshot
+                delete_snapshot(platform, new_name)
+                st.sidebar.warning(
+                    f"⛔ {platform}: overlap rejected\n\n"
+                    f"Overlaps existing range.\nSee Snapshot Manager."
+                )
+            else:
+                st.cache_data.clear()
+                st.sidebar.success(f"✅ {platform} saved\n\n{new_name}")
+        else:
+            st.sidebar.info(f"ℹ️ {platform}: already covered")
+
+        st.session_state["ov_uploader_key"] += 1
+        st.rerun()
+
+st.sidebar.caption("📊 Coverage / delete → Snapshot Manager")
 
 # ============================================================
 # LOAD ALL PLATFORMS
@@ -239,14 +249,17 @@ nav_change = 0
 nav_pct = 0
 
 def _prev_nav(df, current_nav):
-    if df.empty or "NAV" not in df.columns:
+    if df.empty or "NAV" not in df.columns or "SnapshotFile" not in df.columns:
         return current_nav
-    if "Timestamp" not in df.columns:
-        return current_nav
-    df_sorted = df.sort_values("Timestamp")
-    if len(df_sorted) >= 2:
+    def _end(snap):
+        m = re.search(r"\((\d{8})-(\d{8})\)", str(snap))
+        return m.group(2) if m else "00000000"
+    d = df.copy()
+    d["_k"] = d["SnapshotFile"].apply(_end)
+    d = d.sort_values("_k")
+    if len(d) >= 2:
         try:
-            return float(df_sorted.iloc[-2]["NAV"])
+            return float(d.iloc[-2]["NAV"])
         except:
             return current_nav
     return current_nav
@@ -303,7 +316,7 @@ else:
 st.title("📊 Portfolio Overview")
 
 filter_label = f" — {platform_filter}" if platform_filter != "All" else ""
-st.subheader(f"账户总览 PORTFOLIO OVERVIEW{filter_label}")
+st.subheader(f"PORTFOLIO OVERVIEW{filter_label}")
 
 portfolio_color = "#66FF99" if portfolio_return >= 0 else "#FF6666"
 change_color = "#66FF99" if nav_change >= 0 else "#FF6666"
@@ -331,7 +344,7 @@ SGD ${total_nav:,.2f}
 </div>
 
 <div>
-<div style='color:gray; font-size:13px;'>Holding P&L</div>
+<div style='color:gray; font-size:13px;'>Holding P&amp;L</div>
 <div style='color:{pnl_color}; font-size:24px; font-weight:bold;'>
 SGD ${real_pnl:,.2f}
 </div>
@@ -345,7 +358,7 @@ SGD ${net_capital:,.2f}
 </div>
 
 <div>
-<div style='color:gray; font-size:13px;'>本次变化</div>
+<div style='color:gray; font-size:13px;'>Period Change</div>
 <div style='color:{change_color}; font-size:24px; font-weight:bold;'>
 SGD ${nav_change:,.2f} ({nav_pct:.2f}%)
 </div>
@@ -368,7 +381,7 @@ SGD ${portfolio_return:,.2f}
 </div>
 
 <div>
-<div style='color:gray; font-size:13px;'>上次净值</div>
+<div style='color:gray; font-size:13px;'>Previous NAV</div>
 <div style='color:white; font-size:22px; font-weight:bold;'>
 SGD ${previous_nav:,.2f}
 </div>
@@ -409,8 +422,8 @@ background: linear-gradient(90deg, #00D4FF, #4A7BFF);'>
 </div>
 
 <div style='display:flex; justify-content:space-between; margin-top:8px; flex-wrap:wrap; gap:8px;'>
-<span style='color:white; font-size:13px;'>{progress:.1f}% 完成 / 目标 SGD ${target_nav:,.2f}</span>
-<span style='color:gray; font-size:13px;'>距离目标 SGD ${remaining:,.2f}</span>
+<span style='color:white; font-size:13px;'>{progress:.1f}% of Target · SGD ${target_nav:,.2f}</span>
+<span style='color:gray; font-size:13px;'>SGD ${remaining:,.2f} to go</span>
 </div>
 
 </div>
@@ -528,7 +541,7 @@ if len(all_option_positions) > 0:
     if expiring_7d or expiring_14d or expiring_30d:
 
         st.markdown(
-            "<div class='section-title'>⚠️ Options 到期警报</div>",
+            "<div class='section-title'>⚠️ Options Expiry Alert</div>",
             unsafe_allow_html=True
         )
 
@@ -602,9 +615,9 @@ if len(all_option_positions) > 0:
 
             st.markdown(card_html, unsafe_allow_html=True)
 
-        render_expiry_group("🔴 7 天内到期", expiring_7d, "#FF6666")
-        render_expiry_group("🟡 8-14 天到期", expiring_14d, "#FFC300")
-        render_expiry_group("🟢 15-30 天到期", expiring_30d, "#00D4AA")
+        render_expiry_group("🔴 Expiring in 7 days", expiring_7d, "#FF6666")
+        render_expiry_group("🟡 Expiring in 8-14 days", expiring_14d, "#FFC300")
+        render_expiry_group("🟢 Expiring in 15-30 days", expiring_30d, "#00D4AA")
 
 
 # ============================================================
@@ -647,13 +660,13 @@ def _load_journal_map():
     Read trades_history.csv → latest Group + Breakeven
     per (Platform, Underlying).
     """
-    from app import TRADES_HISTORY_FILE
+    from app import get_trades_history_file
 
-    if not os.path.exists(TRADES_HISTORY_FILE):
+    if not os.path.exists(get_trades_history_file()):
         return {}
 
     try:
-        df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        df = pd.read_csv(get_trades_history_file(), dtype=str)
     except:
         return {}
 
@@ -761,7 +774,7 @@ warning = [r for r in unique_rows if 5 <= r["Buffer"] < 10]
 if danger or warning:
 
     st.markdown(
-        "<div class='section-title'>🚨 Buffer Alert (距离 Breakeven)</div>",
+        "<div class='section-title'>🚨 Buffer Alert (vs Breakeven)</div>",
         unsafe_allow_html=True
     )
 
@@ -839,14 +852,15 @@ if danger or warning:
 
         st.markdown(card_html, unsafe_allow_html=True)
 
-    render_buffer_group("🔥 危险 Buffer < 5%", danger, "#FF6666")
-    render_buffer_group("⚠ 警告 Buffer < 10%", warning, "#FFC300")
+    render_buffer_group("🔥 Danger Buffer < 5%", danger, "#FF6666")
+    render_buffer_group("⚠ Warning Buffer < 10%", warning, "#FFC300")
+
 
 # ============================================================
 # 🏦 平台占比
 # ============================================================
 st.markdown(
-    "<div class='section-title'>🏦 平台占比</div>",
+    "<div class='section-title'>🏦 Platform Allocation</div>",
     unsafe_allow_html=True
 )
 
@@ -887,7 +901,7 @@ if platform_data:
             plot_bgcolor="#111827",
             font_color="white"
         )
-        st.plotly_chart(fig_platform, use_container_width=True)
+        st.plotly_chart(fig_platform, width="stretch")
 
     with col2:
         st.markdown("### 💰 Platform Holdings")
@@ -932,11 +946,11 @@ if platform_data:
 # CHART 1 - 总资产配置（% NetLiq）+ Targets
 # ============================================================
 st.markdown(
-    "<div class='section-title'>📊 持仓分析</div>",
+    "<div class='section-title'>📊 Holdings Analysis</div>",
     unsafe_allow_html=True
 )
 
-st.markdown("### 1️⃣ 总资产配置（% NetLiq）")
+st.markdown("### 1️⃣ Total Asset Allocation (% NetLiq)")
 
 col1, col2 = st.columns([1, 1])
 
@@ -970,7 +984,7 @@ with col1:
         showlegend=False,
         height=350
     )
-    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(fig1, width="stretch")
 
 with col2:
     st.markdown("### 🎯 Allocation Targets")
@@ -1052,7 +1066,7 @@ tab_etf, tab_stock, tab_option, tab_cash = st.tabs([
 # ---------- TAB ETF ----------
 with tab_etf:
     if len(index_etf_positions) > 0:
-        st.markdown("### 2️⃣ 大盘 ETF 分布")
+        st.markdown("### 2️⃣ Index ETF Allocation")
         col1, col2 = st.columns([1, 1])
 
         with col1:
@@ -1069,7 +1083,7 @@ with tab_etf:
                 plot_bgcolor="#111827",
                 font_color="white"
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
 
         with col2:
             st.markdown("### 💰 ETF Holdings")
@@ -1100,12 +1114,12 @@ with tab_etf:
                 unsafe_allow_html=True
             )
     else:
-        st.info("暂无 ETF 持仓")
+        st.info("No ETF holdings")
 
 # ---------- TAB STOCK ----------
 with tab_stock:
     if len(stock_positions) > 0:
-        st.markdown("### 3️⃣ 个股分布")
+        st.markdown("### 3️⃣ Individual Stock Allocation")
         col1, col2 = st.columns([1, 1])
 
         with col1:
@@ -1122,7 +1136,7 @@ with tab_stock:
                 plot_bgcolor="#111827",
                 font_color="white"
             )
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width="stretch")
 
         with col2:
             st.markdown("### 🎯 Individual Stock Targets")
@@ -1168,12 +1182,12 @@ with tab_stock:
                 unsafe_allow_html=True
             )
     else:
-        st.info("暂无个股持仓")
+        st.info("No individual stock holdings")
 
 # ---------- TAB OPTION ----------
 with tab_option:
     if len(option_positions) > 0:
-        st.markdown("### 4️⃣ 期权持仓分布（Exposure）")
+        st.markdown("### 4️⃣ Options Allocation (Exposure)")
         col1, col2 = st.columns([1, 1])
 
         with col1:
@@ -1196,7 +1210,7 @@ with tab_option:
                 plot_bgcolor="#111827",
                 font_color="white"
             )
-            st.plotly_chart(fig4, use_container_width=True)
+            st.plotly_chart(fig4, width="stretch")
 
         with col2:
             st.markdown("### 💰 Options Holdings")
@@ -1233,7 +1247,7 @@ with tab_option:
                 unsafe_allow_html=True
             )
     else:
-        st.info("暂无期权持仓")
+        st.info("No options holdings")
 
 # ---------- TAB CASH ----------
 with tab_cash:
@@ -1273,7 +1287,7 @@ with tab_cash:
             font_color="white",
             showlegend=False
         )
-        st.plotly_chart(fig_cash, use_container_width=True)
+        st.plotly_chart(fig_cash, width="stretch")
 
     with col2:
         st.markdown("### 💵 Cash by Platform")
@@ -1332,7 +1346,7 @@ with tab_cash:
 # POSITION DETAILS
 # ============================================================
 st.markdown(
-    "<div class='section-title'>📋 持仓明细</div>",
+    "<div class='section-title'>📋 Position Details</div>",
     unsafe_allow_html=True
 )
 
@@ -1343,9 +1357,16 @@ if df_positions is not None and not df_positions.empty:
                 "PositionValue", "PositionValueSgd",
                 "UnrealizedPnL", "UnrealizedPnLSgd"],
     )
-    st.dataframe(positions_display, use_container_width=True, hide_index=True)
+    # ⭐ Cast mixed-type columns to string so Arrow can serialize cleanly
+    for _c in ["Strike", "Put/Call", "Expiry", "DTE"]:
+        if _c in positions_display.columns:
+            positions_display[_c] = positions_display[_c].astype(str).replace(
+                {"nan": "", "None": "", "NaT": ""}
+            )
+    st.dataframe(positions_display, width="stretch", hide_index=True)
+    
 else:
-    st.info("暂无持仓数据")
+    st.info("No position data")
 
 # ============================================================
 # HISTORY
@@ -1355,6 +1376,14 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+def _hist_dates(df):
+    """Return datetime Series parsed from SnapshotFile end-date (YYYYMMDD)."""
+    def _end(snap):
+        m = re.search(r"\((\d{8})-(\d{8})\)", str(snap))
+        return m.group(2) if m else None
+    return pd.to_datetime(df["SnapshotFile"].apply(_end), format="%Y%m%d", errors="coerce")
+
+
 show_ibkr_line = platform_filter in ("All", "IBKR") and not ibkr_history.empty
 show_tiger_line = platform_filter in ("All", "Tiger") and not tiger_history.empty
 show_moomoo_line = platform_filter in ("All", "Moomoo") and not moomoo_history.empty
@@ -1363,39 +1392,45 @@ if show_ibkr_line or show_tiger_line or show_moomoo_line:
 
     fig_history = go.Figure()
 
-    if show_ibkr_line and "Timestamp" in ibkr_history.columns and "NAV" in ibkr_history.columns:
+    if show_ibkr_line and "SnapshotFile" in ibkr_history.columns and "NAV" in ibkr_history.columns:
         fig_history.add_trace(go.Scatter(
-            x=ibkr_history["Timestamp"], y=ibkr_history["NAV"],
+            x=_hist_dates(ibkr_history),
+            y=pd.to_numeric(ibkr_history["NAV"], errors="coerce"),
             mode="lines+markers",
             line=dict(color="#00D4FF", width=3),
             marker=dict(size=8), name="IBKR"
         ))
 
-    if show_tiger_line and "Timestamp" in tiger_history.columns and "NAV" in tiger_history.columns:
+    if show_tiger_line and "SnapshotFile" in tiger_history.columns and "NAV" in tiger_history.columns:
         fig_history.add_trace(go.Scatter(
-            x=tiger_history["Timestamp"], y=tiger_history["NAV"],
+            x=_hist_dates(tiger_history),
+            y=pd.to_numeric(tiger_history["NAV"], errors="coerce"),
             mode="lines+markers",
             line=dict(color="#FFC300", width=3),
             marker=dict(size=8), name="Tiger"
         ))
 
-    if show_moomoo_line and "Timestamp" in moomoo_history.columns and "NAV" in moomoo_history.columns:
+    if show_moomoo_line and "SnapshotFile" in moomoo_history.columns and "NAV" in moomoo_history.columns:
         fig_history.add_trace(go.Scatter(
-            x=moomoo_history["Timestamp"], y=moomoo_history["NAV"],
+            x=_hist_dates(moomoo_history),
+            y=pd.to_numeric(moomoo_history["NAV"], errors="coerce"),
             mode="lines+markers",
             line=dict(color="#FF6699", width=3),
             marker=dict(size=8), name="Moomoo"
         ))
 
+
     if platform_filter == "All" and (sum([show_ibkr_line, show_tiger_line, show_moomoo_line]) > 1):
         try:
             frames = [d for d in [ibkr_history, tiger_history, moomoo_history] if not d.empty]
             combined_history_df = pd.concat(frames, ignore_index=True)
-            combined_grouped = combined_history_df.groupby("Timestamp")["NAV"].sum().reset_index()
-            combined_grouped = combined_grouped.sort_values("Timestamp")
+            combined_history_df["_dt"] = _hist_dates(combined_history_df)
+            combined_history_df["NAV"] = pd.to_numeric(combined_history_df["NAV"], errors="coerce")
+            combined_grouped = combined_history_df.groupby("_dt")["NAV"].sum().reset_index()
+            combined_grouped = combined_grouped.sort_values("_dt")
 
             fig_history.add_trace(go.Scatter(
-                x=combined_grouped["Timestamp"], y=combined_grouped["NAV"],
+                x=combined_grouped["_dt"], y=combined_grouped["NAV"],
                 mode="lines+markers",
                 line=dict(color="#66FF99", width=3, dash="dot"),
                 marker=dict(size=8), name="Combined"
@@ -1433,7 +1468,7 @@ if show_ibkr_line or show_tiger_line or show_moomoo_line:
         )
     )
 
-    st.plotly_chart(fig_history, use_container_width=True)
+    st.plotly_chart(fig_history, width="stretch")
 
     if history_df is not None and not history_df.empty and "Timestamp" in history_df.columns:
 
@@ -1452,14 +1487,20 @@ if show_ibkr_line or show_tiger_line or show_moomoo_line:
         # Filter to only columns that exist
         essential_available = [c for c in essential_cols if c in history_df.columns]
 
-        history_sorted = history_df.sort_values(by="Timestamp", ascending=False)
+        # ⭐ Sort by SnapshotFile end-date (clean YYYYMMDD) so latest is on top.
+        # Timestamp column is a mix of ISO + D/M/YYYY text, which sorts wrong.
+        history_sorted = history_df.copy()
+        history_sorted["_sortdt"] = _hist_dates(history_sorted)
+        history_sorted = history_sorted.sort_values(
+            "_sortdt", ascending=False
+        ).drop(columns=["_sortdt"])
 
         # Main compact view
         history_display = format_df(
             history_sorted[essential_available],
             cols_2dp=["NAV", "Cash", "PnL", "PeriodDeposit", "PeriodWithdrawal"],
         )
-        st.dataframe(history_display, use_container_width=True, hide_index=True)
+        st.dataframe(history_display, width="stretch", hide_index=True)
 
         # Full detail hidden behind expander
         with st.expander("📊 Show full details (cumulative totals, dividends, fees, FX)"):
@@ -1472,6 +1513,6 @@ if show_ibkr_line or show_tiger_line or show_moomoo_line:
                         "Dividends", "WithholdingTax", "NetDividends", "Fees"],
                 cols_3dp=["UsdToSgd"],
             )
-            st.dataframe(history_full, use_container_width=True, hide_index=True)
+            st.dataframe(history_full, width="stretch", hide_index=True)
 else:
-    st.info("暂无历史记录")
+    st.info("No history records")

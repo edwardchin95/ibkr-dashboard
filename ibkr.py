@@ -5,8 +5,8 @@ import re
 from datetime import datetime, timedelta
 
 from app import (
-    SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR,
-    TRADES_HISTORY_FILE,
+    get_snapshot_dir, get_history_file, get_incoming_dir,
+    get_trades_history_file,
     INDEX_ETFS,
     TARGET_ETF_STOCK_TOTAL, TARGET_SINGLE_STOCK,
     TARGET_OPTION_TOTAL, TARGET_CASH,
@@ -20,9 +20,14 @@ from app import (
 # IBKR-specific Constants
 # ============================================================
 
-IBKR_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "ibkr")
-os.makedirs(IBKR_SNAPSHOT_DIR, exist_ok=True)
+def get_ibkr_snapshot_dir():
+    path = os.path.join(get_snapshot_dir(), "ibkr")
+    os.makedirs(path, exist_ok=True)
+    return path
 
+
+# Alias for backward compatibility
+IBKR_SNAPSHOT_DIR = get_ibkr_snapshot_dir()
 
 # ============================================================
 # Detect
@@ -473,14 +478,14 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
     if fd and ld:
         snapshot_filename = f"ibkr_statement({fd}-{ld}){ext_part}"
         if len(ld) == 8 and ld.isdigit():
-            timestamp = f"{ld[:4]}-{ld[4:6]}-{ld[6:8]}"
+            timestamp = f"{int(ld[6:8])}/{int(ld[4:6])}/{ld[:4]}"
         else:
             timestamp = str(last_date)
     else:
         snapshot_filename = f"{name_part}_{upload_time}{ext_part}"
         timestamp = upload_time
 
-    snapshot_path = os.path.join(IBKR_SNAPSHOT_DIR, snapshot_filename)
+    snapshot_path = os.path.join(get_ibkr_snapshot_dir(), snapshot_filename)
     with open(snapshot_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
@@ -506,9 +511,9 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
     period_other = 0
 
     # Load existing history
-    if os.path.exists(HISTORY_FILE):
+    if os.path.exists(get_history_file()):
         try:
-            history_df = pd.read_csv(HISTORY_FILE)
+            history_df = pd.read_csv(get_history_file())
         except:
             history_df = pd.DataFrame()
     else:
@@ -545,7 +550,7 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
     # ⭐ Recompute Total* from cumsum
     history_df = _recompute_cumulative(history_df, "IBKR")
 
-    history_df.to_csv(HISTORY_FILE, index=False)
+    history_df.to_csv(get_history_file(), index=False)
 
     # Save trades
     uploaded_file.seek(0)
@@ -559,11 +564,11 @@ def save_snapshot_and_history(uploaded_file, nav, cash, pnl, deposit):
 # ============================================================
 
 def load_latest_snapshot():
-    if not os.path.exists(HISTORY_FILE):
+    if not os.path.exists(get_history_file()):
         return None
 
     try:
-        history_df = pd.read_csv(HISTORY_FILE)
+        history_df = pd.read_csv(get_history_file())
     except:
         return None
 
@@ -579,13 +584,24 @@ def load_latest_snapshot():
     if ibkr_df.empty:
         return None
 
+    # ⭐ Sort by SnapshotFile end-date (YYYYMMDD) — immune to Timestamp format mix
+    def _extract_end_date(snap):
+        s = str(snap)
+        m = re.search(r"\(\d{8}-(\d{8})\)", s)
+        return m.group(1) if m else "00000000"
+
+    ibkr_df = ibkr_df.copy()
+    ibkr_df["_sort_key"] = ibkr_df["SnapshotFile"].apply(_extract_end_date)
+    ibkr_df = ibkr_df.sort_values("_sort_key").drop(columns=["_sort_key"])
+
     latest = ibkr_df.iloc[-1]
     snapshot_file = latest["SnapshotFile"]
 
-    # New location first, fallback old location
-    snapshot_path = os.path.join(IBKR_SNAPSHOT_DIR, snapshot_file)
+    # ⭐ New location (/ibkr subfolder); fall back to old base dir for
+    # legacy files saved before the subfolder switch.
+    snapshot_path = os.path.join(get_ibkr_snapshot_dir(), snapshot_file)
     if not os.path.exists(snapshot_path):
-        legacy = os.path.join(SNAPSHOT_DIR, snapshot_file)
+        legacy = os.path.join(get_snapshot_dir(), snapshot_file)
         if os.path.exists(legacy):
             snapshot_path = legacy
         else:
@@ -620,27 +636,27 @@ def load_latest_snapshot():
 # ============================================================
 
 def process_incoming():
-    if not os.path.exists(INCOMING_DIR):
+    if not os.path.exists(get_incoming_dir()):
         return
 
     incoming_files = sorted([
-        f for f in os.listdir(INCOMING_DIR)
+        f for f in os.listdir(get_incoming_dir())
         if f.endswith(".csv")
     ])
 
     if len(incoming_files) == 0:
         return
 
-    if os.path.exists(HISTORY_FILE):
+    if os.path.exists(get_history_file()):
         try:
-            history_df = pd.read_csv(HISTORY_FILE)
+            history_df = pd.read_csv(get_history_file())
         except:
             history_df = pd.DataFrame()
     else:
         history_df = pd.DataFrame()
 
     for f in incoming_files:
-        incoming_path = os.path.join(INCOMING_DIR, f)
+        incoming_path = os.path.join(get_incoming_dir(), f)
 
         with open(incoming_path, "rb") as fh:
             raw = fh.read()
@@ -685,7 +701,7 @@ def process_incoming():
         if fd and ld:
             new_name = f"ibkr_statement({fd}-{ld}).csv"
             if len(ld) == 8 and ld.isdigit():
-                timestamp = f"{ld[:4]}-{ld[4:6]}-{ld[6:8]}"
+                timestamp = f"{int(ld[6:8])}/{int(ld[4:6])}/{ld[:4]}"
             else:
                 timestamp = str(last_date)
         else:
@@ -722,7 +738,7 @@ def process_incoming():
 
         history_df = pd.concat([history_df, new_row], ignore_index=True)
 
-        snapshot_path = os.path.join(IBKR_SNAPSHOT_DIR, new_name)
+        snapshot_path = os.path.join(get_ibkr_snapshot_dir(), new_name)
         os.rename(incoming_path, snapshot_path)
 
     if "SnapshotFile" in history_df.columns and "Platform" in history_df.columns:
@@ -733,7 +749,7 @@ def process_incoming():
     # ⭐ Recompute Total* from cumsum
     history_df = _recompute_cumulative(history_df, "IBKR")
 
-    history_df.to_csv(HISTORY_FILE, index=False)
+    history_df.to_csv(get_history_file(), index=False)
 
 # ============================================================
 # ANALYZE POSITIONS (uses PositionValueSgd directly)
@@ -976,9 +992,9 @@ def save_trades_history(file_obj, fx_ratio=None, snapshot_file=""):
 
     new_trades = new_trades[UNIFIED_TRADES_COLS]
 
-    if os.path.exists(TRADES_HISTORY_FILE):
+    if os.path.exists(get_trades_history_file()):
         try:
-            existing = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+            existing = pd.read_csv(get_trades_history_file(), dtype=str)
         except:
             existing = pd.DataFrame()
     else:
@@ -999,7 +1015,7 @@ def save_trades_history(file_obj, fx_ratio=None, snapshot_file=""):
                 ascending=[True, False, True]
             )
 
-        combined.to_csv(TRADES_HISTORY_FILE, index=False)
+        combined.to_csv(get_trades_history_file(), index=False)
         return load_trades_history()
 
     for col in UNIFIED_TRADES_COLS:
@@ -1070,17 +1086,17 @@ def save_trades_history(file_obj, fx_ratio=None, snapshot_file=""):
             ascending=[True, False, True]
         )
 
-    combined.to_csv(TRADES_HISTORY_FILE, index=False)
+    combined.to_csv(get_trades_history_file(), index=False)
 
     return load_trades_history()
 
 
 def load_trades_history():
-    if not os.path.exists(TRADES_HISTORY_FILE):
+    if not os.path.exists(get_trades_history_file()):
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
 
     try:
-        df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        df = pd.read_csv(get_trades_history_file(), dtype=str)
     except:
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
 
@@ -1188,11 +1204,11 @@ def load_cash_summary_total():
         "fees": 0, "deposits": 0, "withdrawals": 0, "other": 0,
     }
 
-    if not os.path.exists(HISTORY_FILE):
+    if not os.path.exists(get_history_file()):
         return default
 
     try:
-        df = pd.read_csv(HISTORY_FILE)
+        df = pd.read_csv(get_history_file())
     except:
         return default
 

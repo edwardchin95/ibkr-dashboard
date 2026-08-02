@@ -5,3 +5,10 @@ data/
 .gitignore
 moomoo_api.py
 README.md
+mmoo_api.py
+repair_dates.py
+test_oauth.py
+google_credential.json
+*.bak
+.streamlit/secrets.toml
+.streamlit/secrets.toml2

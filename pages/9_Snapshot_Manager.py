@@ -2,20 +2,39 @@ import streamlit as st
 import pandas as pd
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app import (
     require_auth,
     load_css,
-    HISTORY_FILE,
-    TRADES_HISTORY_FILE,
-    SNAPSHOT_DIR,
+    get_history_file,
+    get_trades_history_file,
+    get_snapshot_dir,
     detect_coverage_gaps,
+    detect_platform,
+    _existing_snapshot_files,
+    _find_overlap,
+    delete_snapshot,
+    _get_open_trading_days,
 )
 
-from ibkr import IBKR_SNAPSHOT_DIR
-from tiger import TIGER_SNAPSHOT_DIR
-from moomoo import MOOMOO_SNAPSHOT_DIR
+from ibkr import (
+    get_ibkr_snapshot_dir,
+    save_snapshot_and_history as save_ibkr_snapshot,
+    extract_nav_cash as ibkr_extract_nav_cash,
+    extract_total_pnl as ibkr_extract_total_pnl,
+    extract_total_deposit as ibkr_extract_total_deposit,
+)
+
+from tiger import (
+    get_tiger_snapshot_dir,
+    save_snapshot_and_history as save_tiger_snapshot,
+)
+
+from moomoo import (
+    get_moomoo_snapshot_dir,
+    save_snapshot_and_history as save_moomoo_snapshot,
+)
 
 
 # ============================================================
@@ -45,9 +64,9 @@ st.caption("Manage uploaded statements, review coverage, and delete accidental u
 # ============================================================
 
 PLATFORMS = {
-    "IBKR": IBKR_SNAPSHOT_DIR,
-    "Tiger": TIGER_SNAPSHOT_DIR,
-    "Moomoo": MOOMOO_SNAPSHOT_DIR,
+    "IBKR": get_ibkr_snapshot_dir,
+    "Tiger": get_tiger_snapshot_dir,
+    "Moomoo": get_moomoo_snapshot_dir,
 }
 
 # Snapshots whose START DATE falls on or after this cutoff are guaranteed
@@ -62,19 +81,19 @@ DELETE_CUTOFF = datetime(2026, 7, 16)
 # ============================================================
 
 def _load_history():
-    if not os.path.exists(HISTORY_FILE):
+    if not os.path.exists(get_history_file()):
         return pd.DataFrame()
     try:
-        return pd.read_csv(HISTORY_FILE)
+        return pd.read_csv(get_history_file())
     except:
         return pd.DataFrame()
 
 
 def _load_trades():
-    if not os.path.exists(TRADES_HISTORY_FILE):
+    if not os.path.exists(get_trades_history_file()):
         return pd.DataFrame()
     try:
-        return pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        return pd.read_csv(get_trades_history_file(), dtype=str)
     except:
         return pd.DataFrame()
 
@@ -121,7 +140,60 @@ def _sort_key(snapshot_name):
     _, end = _extract_date_range(snapshot_name)
     return end or "0000-00-00"
 
+def _get_next_upload_date(platform, history_df):
+    """
+    Find the latest END date across this platform's snapshots (read from
+    the SnapshotFile names) and return the NEXT day as an ISO string.
 
+    This is what the user should set as the START date of their next
+    statement export. Returns "" if no dated snapshot exists.
+    """
+    if history_df is None or history_df.empty:
+        return ""
+    if "Platform" not in history_df.columns or "SnapshotFile" not in history_df.columns:
+        return ""
+
+    sub = history_df[history_df["Platform"].astype(str) == platform]
+    if sub.empty:
+        return ""
+
+    latest_end = ""
+    for name in sub["SnapshotFile"].astype(str):
+        _, end = _extract_date_range(name)
+        if end and end > latest_end:
+            latest_end = end
+
+    if not latest_end:
+        return ""
+
+    try:
+        end_dt = datetime.strptime(latest_end, "%Y-%m-%d")
+        # ⭐ Advance to the next TRADING day (NYSE or SGX open),
+        # skipping weekends + US/SG holidays.
+        candidate = end_dt + timedelta(days=1)
+        open_days = _get_open_trading_days(candidate, candidate + timedelta(days=10))
+        future_open = sorted(d for d in open_days if d >= candidate.date())
+        if future_open:
+            return future_open[0].strftime("%Y-%m-%d")
+        return candidate.strftime("%Y-%m-%d")
+    except:
+        return ""
+
+def _advance_one_trading_day(iso_date):
+    """Return the next trading day (NYSE or SGX open) strictly after iso_date."""
+    if not iso_date:
+        return ""
+    try:
+        d = datetime.strptime(iso_date, "%Y-%m-%d")
+        candidate = d + timedelta(days=1)
+        open_days = _get_open_trading_days(candidate, candidate + timedelta(days=10))
+        future_open = sorted(x for x in open_days if x >= candidate.date())
+        if future_open:
+            return future_open[0].strftime("%Y-%m-%d")
+        return candidate.strftime("%Y-%m-%d")
+    except:
+        return iso_date
+    
 def _count_impact(snapshot_name, platform, history_df, trades_df):
     portfolio_rows = 0
     trade_rows = 0
@@ -164,52 +236,145 @@ def _is_deletable(snapshot_name):
 
 
 def _delete_snapshot(platform, snapshot_name):
-    if os.path.exists(HISTORY_FILE):
-        try:
-            hdf = pd.read_csv(HISTORY_FILE)
-            if not hdf.empty and "Platform" in hdf.columns and "SnapshotFile" in hdf.columns:
-                mask = ~(
-                    (hdf["Platform"].astype(str) == platform)
-                    & (hdf["SnapshotFile"].astype(str) == snapshot_name)
-                )
-                hdf = hdf[mask]
-                hdf.to_csv(HISTORY_FILE, index=False)
-        except:
-            pass
-
-    if os.path.exists(TRADES_HISTORY_FILE):
-        try:
-            tdf = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
-            if not tdf.empty and "Platform" in tdf.columns and "SnapshotFile" in tdf.columns:
-                mask = ~(
-                    (tdf["Platform"].astype(str) == platform)
-                    & (tdf["SnapshotFile"].astype(str) == snapshot_name)
-                )
-                tdf = tdf[mask]
-                tdf.to_csv(TRADES_HISTORY_FILE, index=False)
-        except:
-            pass
-
-    snap_dir = PLATFORMS.get(platform)
-    if snap_dir:
-        snap_path = os.path.join(snap_dir, snapshot_name)
-        if os.path.exists(snap_path):
-            try:
-                os.remove(snap_path)
-            except:
-                pass
-
+    """Thin wrapper — delegates to the shared delete in app.py."""
+    delete_snapshot(platform, snapshot_name)
     try:
         st.cache_data.clear()
     except:
         pass
 
 
+def _save_uploaded_file(platform, uploaded_file):
+    """
+    Route an uploaded file to the correct broker save function.
+    Mirrors overview.py behaviour (IBKR needs pre-extracted nav/cash/pnl/deposit).
+    """
+    if platform == "IBKR":
+        uploaded_file.seek(0)
+        total_nav, cash_v, _, _ = ibkr_extract_nav_cash(uploaded_file)
+
+        uploaded_file.seek(0)
+        pnl_v = ibkr_extract_total_pnl(uploaded_file)
+
+        uploaded_file.seek(0)
+        deposit_raw = ibkr_extract_total_deposit(uploaded_file)
+
+        uploaded_file.seek(0)
+        save_ibkr_snapshot(uploaded_file, total_nav, cash_v, pnl_v, deposit_raw)
+
+    elif platform == "Tiger":
+        uploaded_file.seek(0)
+        save_tiger_snapshot(uploaded_file)
+
+    elif platform == "Moomoo":
+        uploaded_file.seek(0)
+        save_moomoo_snapshot(uploaded_file)
+
+
+# ============================================================
+# UPLOAD STATEMENTS (auto-process, no button — like Overview)
+# ============================================================
+
+st.markdown("## 📤 Upload Statements")
+
+# The uploader's key changes after each processing run. Bumping the key
+# resets the widget to empty, so (a) the processed file disappears from
+# the uploader, and (b) there is no session "memory" blocking a re-upload
+# of the same file after you delete it.
+if "uploader_key" not in st.session_state:
+    st.session_state["uploader_key"] = 0
+
+uploaded_files = st.file_uploader(
+    "Upload statement CSV files",
+    type=["csv"],
+    accept_multiple_files=True,
+    key=f"stmt_uploader_{st.session_state['uploader_key']}",
+    help="IBKR, Tiger and Moomoo CSV statements are supported. Files are processed automatically."
+)
+
+if uploaded_files:
+
+    results = []  # list of (filename, status, message)
+    any_new = False
+
+    for uploaded_file in uploaded_files:
+
+        raw = uploaded_file.getvalue()
+        platform = detect_platform(raw)
+
+        if platform not in ("IBKR", "Tiger", "Moomoo"):
+            results.append((uploaded_file.name, "error", "Unsupported statement format"))
+            continue
+
+        # Snapshot list BEFORE saving — used for duplicate/overlap detection
+        before = _existing_snapshot_files(platform)
+
+        try:
+            _save_uploaded_file(platform, uploaded_file)
+        except Exception as e:
+            results.append((uploaded_file.name, "error", f"{platform} · {str(e)}"))
+            continue
+
+        after = _existing_snapshot_files(platform)
+        new_files = after - before
+
+        if new_files:
+            new_name = sorted(new_files)[0]
+
+            # ⭐ Overlap guard: if the newly-saved range overlaps an existing
+            # statement by 2+ days, roll it back (delete) and warn the user.
+            overlap_with = _find_overlap(new_name, before)
+
+            if overlap_with:
+                _delete_snapshot(platform, new_name)
+                results.append(
+                    (uploaded_file.name, "overlap",
+                     f"{platform} · range **{new_name}** overlaps existing "
+                     f"**{overlap_with}**. Upload rejected — export a "
+                     f"non-overlapping range instead.")
+                )
+            else:
+                any_new = True
+                results.append(
+                    (uploaded_file.name, "success",
+                     f"{platform} · saved as **{new_name}**")
+                )
+        else:
+            # Same filename/date range already exists → nothing new was added
+            results.append(
+                (uploaded_file.name, "duplicate",
+                 f"{platform} · already uploaded / date range already covered")
+            )
+
+    if any_new:
+        st.cache_data.clear()
+
+    # Stash results, reset the uploader (empties the widget), and rerun so
+    # the page reflects the new snapshot immediately.
+    st.session_state["last_upload_results"] = results
+    st.session_state["uploader_key"] += 1
+    st.rerun()
+
+# Show the outcome of the most recent upload (survives the reset rerun above)
+if st.session_state.get("last_upload_results"):
+    for name, status, msg in st.session_state["last_upload_results"]:
+        if status == "success":
+            st.success(f"✅ **{name}** processed — {msg}")
+        elif status == "duplicate":
+            st.info(f"ℹ️ **{name}** — {msg}")
+        elif status == "overlap":
+            st.warning(f"⛔ **{name}** — {msg}")
+        else:
+            st.error(f"❌ **{name}** — {msg}")
+
+st.markdown("---")
+
+
 # ============================================================
 # COVERAGE RENDERER — uses native Streamlit metric (no HTML)
 # ============================================================
 
-def _render_coverage_card(platform):
+def _render_coverage_card(platform, history_df):
     coverage_info = detect_coverage_gaps(platform)
 
     if not coverage_info.get("ranges"):
@@ -223,6 +388,21 @@ def _render_coverage_card(platform):
 
     with st.container(border=True):
         st.markdown(f"**{platform}**")
+
+        next_upload = _get_next_upload_date(platform, history_df)
+        if next_upload:
+            if platform == "IBKR":
+                # ⭐ IBKR export includes the trading day BEFORE the selected
+                # "from" date. So to actually capture activity from `next_upload`,
+                # the user must select one trading day later.
+                ibkr_select = _advance_one_trading_day(next_upload)
+                st.info(
+                    f"📌 Next coverage starts **{_pretty_date(next_upload)}** — "
+                    f"but in IBKR export, select **From = {_pretty_date(ibkr_select)}** "
+                    f"(IBKR includes the prior trading day)."
+                )
+            else:
+                st.info(f"📌 Next statement should start from **{_pretty_date(next_upload)}**")
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Statements", n_statements)
@@ -310,7 +490,7 @@ trades_df = _load_trades()
 st.markdown("## 📊 Coverage Overview")
 
 for platform in PLATFORMS.keys():
-    _render_coverage_card(platform)
+    _render_coverage_card(platform, history_df)
 
 st.markdown("---")
 
@@ -337,13 +517,15 @@ def _confirm_delete_dialog(platform, snapshot_name):
 
     c1, c2 = st.columns(2)
 
-    if c1.button("✅ Yes, Delete", type="primary", use_container_width=True):
+    if c1.button("✅ Yes, Delete", type="primary", width="stretch"):
         _delete_snapshot(platform, snapshot_name)
         st.session_state.pop("_pending_delete_snapshot", None)
+        # Clear any stale "processed" message from a previous upload
+        st.session_state.pop("last_upload_results", None)
         st.success("✅ Snapshot deleted.")
         st.rerun()
 
-    if c2.button("❌ Cancel", use_container_width=True):
+    if c2.button("❌ Cancel", width="stretch"):
         st.session_state.pop("_pending_delete_snapshot", None)
         st.rerun()
 
@@ -359,11 +541,55 @@ if st.session_state.get("_pending_delete_snapshot"):
 
 st.markdown("## 📁 Snapshots")
 
+
+def _render_one_snapshot(platform, r):
+    """Render a single snapshot card + its delete button (if deletable)."""
+    snapshot_name = _clean_str(r.get("SnapshotFile", ""))
+    if not snapshot_name:
+        return
+
+    start, end = _extract_date_range(snapshot_name)
+    start_pretty = _pretty_date(start)
+    end_pretty = _pretty_date(end)
+
+    portfolio_rows, trade_rows = _count_impact(
+        snapshot_name, platform, history_df, trades_df
+    )
+    deletable = _is_deletable(snapshot_name)
+
+    range_title = (
+        f"{start_pretty} → {end_pretty}"
+        if start and end
+        else "Unknown date range"
+    )
+
+    _render_snapshot_card(
+        range_title,
+        snapshot_name,
+        portfolio_rows,
+        trade_rows,
+        deletable,
+    )
+
+    if deletable:
+        if st.button(
+            "🗑 Delete this snapshot",
+            key=f"delete_{platform}_{snapshot_name}",
+            width="stretch",
+            type="secondary",
+        ):
+            st.session_state["_pending_delete_snapshot"] = (
+                platform,
+                snapshot_name,
+            )
+            st.rerun()
+
+    st.markdown("")
+
+
 if history_df.empty or "SnapshotFile" not in history_df.columns or "Platform" not in history_df.columns:
     st.info("No snapshot history found.")
 else:
-    current_year = datetime.now().year
-
     for platform, snap_dir in PLATFORMS.items():
         st.markdown(f"### {platform}")
 
@@ -378,56 +604,25 @@ else:
         sub["_sort_key"] = sub["SnapshotFile"].apply(_sort_key)
         sub = sub.sort_values("_sort_key", ascending=False)
 
-        sub["_year"] = sub["SnapshotFile"].apply(_extract_end_year)
-        years = sorted(sub["_year"].unique(), reverse=True)
+        # ⭐ Latest snapshot shown directly (always visible, auto-expanded).
+        latest_row = sub.iloc[0]
+        st.markdown("**🆕 Latest**")
+        _render_one_snapshot(platform, latest_row)
 
-        for year in years:
-            year_sub = sub[sub["_year"] == year].copy()
-            count = len(year_sub)
-            expanded = str(year) == str(current_year)
+        # ⭐ Everything else grouped by year, all collapsed by default.
+        rest = sub.iloc[1:]
+        if not rest.empty:
+            rest = rest.copy()
+            rest["_year"] = rest["SnapshotFile"].apply(_extract_end_year)
+            years = sorted(rest["_year"].unique(), reverse=True)
 
-            with st.expander(f"📅 {year}  ·  {count} snapshots", expanded=expanded):
-                for _, r in year_sub.iterrows():
-                    snapshot_name = _clean_str(r.get("SnapshotFile", ""))
-                    if not snapshot_name:
-                        continue
+            for year in years:
+                year_sub = rest[rest["_year"] == year]
+                count = len(year_sub)
 
-                    start, end = _extract_date_range(snapshot_name)
-                    start_pretty = _pretty_date(start)
-                    end_pretty = _pretty_date(end)
-
-                    portfolio_rows, trade_rows = _count_impact(
-                        snapshot_name, platform, history_df, trades_df
-                    )
-                    deletable = _is_deletable(snapshot_name)
-
-                    range_title = (
-                        f"{start_pretty} → {end_pretty}"
-                        if start and end
-                        else "Unknown date range"
-                    )
-
-                    _render_snapshot_card(
-                        range_title,
-                        snapshot_name,
-                        portfolio_rows,
-                        trade_rows,
-                        deletable,
-                    )
-
-                    if deletable:
-                        if st.button(
-                            "🗑 Delete this snapshot",
-                            key=f"delete_{platform}_{snapshot_name}",
-                            use_container_width=True,
-                            type="secondary",
-                        ):
-                            st.session_state["_pending_delete_snapshot"] = (
-                                platform,
-                                snapshot_name,
-                            )
-                            st.rerun()
-
-                    st.markdown("")
+                # All history expanders collapsed by default
+                with st.expander(f"📅 {year}  ·  {count} snapshots", expanded=False):
+                    for _, r in year_sub.iterrows():
+                        _render_one_snapshot(platform, r)
 
         st.markdown("---")

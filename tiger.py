@@ -6,8 +6,8 @@ import csv
 from datetime import datetime
 
 from app import (
-    SNAPSHOT_DIR, HISTORY_FILE, INCOMING_DIR,
-    TRADES_HISTORY_FILE,
+    get_snapshot_dir, get_history_file, get_incoming_dir,
+    get_trades_history_file,
     INDEX_ETFS,
     TARGET_ETF_STOCK_TOTAL, TARGET_SINGLE_STOCK,
     TARGET_OPTION_TOTAL, TARGET_CASH,
@@ -21,11 +21,16 @@ from app import (
 # Tiger-specific Constants
 # ============================================================
 
-TIGER_SNAPSHOT_DIR = os.path.join(SNAPSHOT_DIR, "tiger")
-os.makedirs(TIGER_SNAPSHOT_DIR, exist_ok=True)
+def get_tiger_snapshot_dir():
+    path = os.path.join(get_snapshot_dir(), "tiger")
+    os.makedirs(path, exist_ok=True)
+    return path
+
 
 # Alias for backward compatibility
-TIGER_TRADES_HISTORY_FILE = TRADES_HISTORY_FILE
+TIGER_SNAPSHOT_DIR = get_tiger_snapshot_dir()
+# Alias for backward compatibility
+TIGER_TRADES_HISTORY_FILE = get_trades_history_file()
 
 
 # ============================================================
@@ -729,7 +734,7 @@ def parse_trades(file_obj, usd_to_sgd=None, snapshot_file=""):
         trade_date = _normalize_trade_date(trade_time)
         if re.match(r"^\d{4}-\d{1,2}-\d{1,2}$", str(trade_date).strip()):
             trade_date = _normalize_trade_date(trade_date)
-            
+
         quantity = _to_float(_safe_get(row, current_idx.get("Quantity")))
         trade_price = _to_float(_safe_get(row, current_idx.get("Trade Price")))
         currency = _safe_get(row, current_idx.get("Currency")) or "USD"
@@ -795,9 +800,9 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
 
     new_trades = new_trades[UNIFIED_TRADES_COLS]
 
-    if os.path.exists(TRADES_HISTORY_FILE):
+    if os.path.exists(get_trades_history_file()):
         try:
-            existing = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+            existing = pd.read_csv(get_trades_history_file(), dtype=str)
         except:
             existing = pd.DataFrame()
     else:
@@ -823,7 +828,7 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
             )
             combined = combined.drop(columns=["_sort_date"])
 
-        combined.to_csv(TRADES_HISTORY_FILE, index=False)
+        combined.to_csv(get_trades_history_file(), index=False)
         return load_trades_history()
 
     for col in UNIFIED_TRADES_COLS:
@@ -896,17 +901,17 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
         )
         combined = combined.drop(columns=["_sort_date"])
 
-    combined.to_csv(TRADES_HISTORY_FILE, index=False)
+    combined.to_csv(get_trades_history_file(), index=False)
 
     return load_trades_history()
 
 
 def load_trades_history():
-    if not os.path.exists(TRADES_HISTORY_FILE):
+    if not os.path.exists(get_trades_history_file()):
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
 
     try:
-        df = pd.read_csv(TRADES_HISTORY_FILE, dtype=str)
+        df = pd.read_csv(get_trades_history_file(), dtype=str)
     except:
         return pd.DataFrame(columns=UNIFIED_TRADES_COLS)
 
@@ -1006,7 +1011,13 @@ def save_snapshot_and_history(uploaded_file, *_args):
 
     if fd and ld:
         snapshot_filename = f"tiger_statement({fd}-{ld}){ext_part}"
-        timestamp = last_date
+                # normalize to d/m/yyyy
+        _t = str(last_date)
+        try:
+            _dt = datetime.strptime(_t[:10], "%Y-%m-%d")
+            timestamp = f"{_dt.day}/{_dt.month}/{_dt.year}"
+        except:
+            timestamp = _t
     else:
         snapshot_filename = f"{name_part}_{upload_time}{ext_part}"
         timestamp = upload_time
@@ -1029,13 +1040,13 @@ def save_snapshot_and_history(uploaded_file, *_args):
     withdrawal_sgd = withdrawal_usd * usd_to_sgd
     period_other = 0  # Tiger doesn't have an "other" category
 
-    snapshot_path = os.path.join(TIGER_SNAPSHOT_DIR, snapshot_filename)
+    snapshot_path = os.path.join(get_tiger_snapshot_dir(), snapshot_filename)
     with open(snapshot_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
 
-    if os.path.exists(HISTORY_FILE):
+    if os.path.exists(get_history_file()):
         try:
-            history_df = pd.read_csv(HISTORY_FILE)
+            history_df = pd.read_csv(get_history_file())
         except:
             history_df = pd.DataFrame()
     else:
@@ -1077,7 +1088,7 @@ def save_snapshot_and_history(uploaded_file, *_args):
     # ⭐ Recompute Total* from cumsum
     history_df = _recompute_cumulative(history_df, "Tiger")
 
-    history_df.to_csv(HISTORY_FILE, index=False)
+    history_df.to_csv(get_history_file(), index=False)
 
     uploaded_file.seek(0)
     save_trades_history(uploaded_file, usd_to_sgd=usd_to_sgd, snapshot_file=snapshot_filename)
@@ -1090,11 +1101,11 @@ def save_snapshot_and_history(uploaded_file, *_args):
 # ============================================================
 
 def load_latest_snapshot():
-    if not os.path.exists(HISTORY_FILE):
+    if not os.path.exists(get_history_file()):
         return None
 
     try:
-        history_df = pd.read_csv(HISTORY_FILE)
+        history_df = pd.read_csv(get_history_file())
     except:
         return None
 
@@ -1109,9 +1120,22 @@ def load_latest_snapshot():
     if tiger_df.empty:
         return None
 
+    def _extract_end_date(snap):
+        s = str(snap)
+        m = re.search(r"\(\d{8}-(\d{8})\)", s)
+        if m:
+            return m.group(1)
+        return "00000000"
+
+    tiger_df = tiger_df.copy()
+    tiger_df["_sort_key"] = tiger_df["SnapshotFile"].apply(_extract_end_date)
+    tiger_df = tiger_df.sort_values("_sort_key")
+    tiger_df = tiger_df.drop(columns=["_sort_key"])
+
     latest = tiger_df.iloc[-1]
+
     snapshot_file = latest["SnapshotFile"]
-    snapshot_path = os.path.join(TIGER_SNAPSHOT_DIR, snapshot_file)
+    snapshot_path = os.path.join(get_tiger_snapshot_dir(), snapshot_file)
 
     if not os.path.exists(snapshot_path):
         return None
@@ -1155,27 +1179,27 @@ def load_latest_snapshot():
 # ============================================================
 
 def process_incoming():
-    if not os.path.exists(INCOMING_DIR):
+    if not os.path.exists(get_incoming_dir()):
         return
 
     incoming_files = sorted([
-        f for f in os.listdir(INCOMING_DIR)
+        f for f in os.listdir(get_incoming_dir())
         if f.endswith(".csv")
     ])
 
     if len(incoming_files) == 0:
         return
 
-    if os.path.exists(HISTORY_FILE):
+    if os.path.exists(get_history_file()):
         try:
-            history_df = pd.read_csv(HISTORY_FILE)
+            history_df = pd.read_csv(get_history_file())
         except:
             history_df = pd.DataFrame()
     else:
         history_df = pd.DataFrame()
 
     for f in incoming_files:
-        incoming_path = os.path.join(INCOMING_DIR, f)
+        incoming_path = os.path.join(get_incoming_dir(), f)
 
         with open(incoming_path, "rb") as fh:
             raw = fh.read()
@@ -1221,7 +1245,13 @@ def process_incoming():
 
         if fd and ld:
             new_name = f"tiger_statement({fd}-{ld}).csv"
-            timestamp = last_date
+                    # normalize to d/m/yyyy
+            _t = str(last_date)
+            try:
+                _dt = datetime.strptime(_t[:10], "%Y-%m-%d")
+                timestamp = f"{_dt.day}/{_dt.month}/{_dt.year}"
+            except:
+                timestamp = _t
         else:
             new_name = f
             timestamp = f.replace("tiger_", "").replace(".csv", "")
@@ -1256,7 +1286,7 @@ def process_incoming():
 
         history_df = pd.concat([history_df, new_row], ignore_index=True)
 
-        snapshot_path = os.path.join(TIGER_SNAPSHOT_DIR, new_name)
+        snapshot_path = os.path.join(get_tiger_snapshot_dir(), new_name)
         os.rename(incoming_path, snapshot_path)
 
     if "SnapshotFile" in history_df.columns and "Platform" in history_df.columns:
@@ -1267,7 +1297,7 @@ def process_incoming():
     # ⭐ Recompute Total* from cumsum
     history_df = _recompute_cumulative(history_df, "Tiger")
 
-    history_df.to_csv(HISTORY_FILE, index=False)
+    history_df.to_csv(get_history_file(), index=False)
 
 
 # ============================================================
@@ -1408,11 +1438,11 @@ def load_cash_summary_total_sgd():
         "fees": 0, "deposits": 0, "withdrawals": 0, "other": 0,
     }
 
-    if not os.path.exists(HISTORY_FILE):
+    if not os.path.exists(get_history_file()):
         return default
 
     try:
-        df = pd.read_csv(HISTORY_FILE)
+        df = pd.read_csv(get_history_file())
     except:
         return default
 

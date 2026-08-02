@@ -7,8 +7,8 @@ from datetime import datetime
 st.set_page_config(page_title="Tiger", page_icon="🐯", layout="wide")
 
 from app import (
-    require_auth, load_css, HISTORY_FILE, format_df, DATA_DIR,
-    TRADES_HISTORY_FILE, OPTION_COLORS,
+    require_auth, load_css, get_history_file, format_df,  get_user_dir,
+    get_trades_history_file, OPTION_COLORS,
     detect_coverage_gaps,
 )
 
@@ -34,13 +34,13 @@ process_incoming()
 # CACHED LOADERS
 # ============================================================
 def _get_history_mtime():
-    if os.path.exists(HISTORY_FILE):
-        return os.path.getmtime(HISTORY_FILE)
+    if os.path.exists(get_history_file()):
+        return os.path.getmtime(get_history_file())
     return 0
 
 def _get_trades_mtime():
-    if os.path.exists(TRADES_HISTORY_FILE):
-        return os.path.getmtime(TRADES_HISTORY_FILE)
+    if os.path.exists(get_trades_history_file()):
+        return os.path.getmtime(get_trades_history_file())
     return 0
 
 
@@ -246,7 +246,7 @@ if df_positions is not None and not df_positions.empty:
                 showlegend=False
             )])
             fig2.update_layout(paper_bgcolor="#111827", plot_bgcolor="#111827", font_color="white")
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
 
         with col2:
 
@@ -306,7 +306,7 @@ if df_positions is not None and not df_positions.empty:
                 showlegend=False
             )])
             fig3.update_layout(paper_bgcolor="#111827", plot_bgcolor="#111827", font_color="white")
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width="stretch")
 
         with col2:
 
@@ -368,7 +368,7 @@ if df_positions is not None and not df_positions.empty:
                 showlegend=False
             )])
             fig4.update_layout(paper_bgcolor="#111827", plot_bgcolor="#111827", font_color="white")
-            st.plotly_chart(fig4, use_container_width=True)
+            st.plotly_chart(fig4, width="stretch")
 
         with col2:
 
@@ -417,7 +417,7 @@ if df_positions is not None and not df_positions.empty:
                 "PositionValue", "PositionValueSgd",
                 "UnrealizedPnL", "UnrealizedPnLSgd"],
     )
-    st.dataframe(positions_display, use_container_width=True, hide_index=True)
+    st.dataframe(positions_display, width="stretch", hide_index=True)
 
     # ============================================================
     # 📝 Recent Trades (read-only)
@@ -473,7 +473,7 @@ if df_positions is not None and not df_positions.empty:
 
         st.dataframe(
             filtered[display_cols],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
