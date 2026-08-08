@@ -236,12 +236,15 @@ def _is_deletable(snapshot_name):
 
 
 def _delete_snapshot(platform, snapshot_name):
-    """Thin wrapper — delegates to the shared delete in app.py."""
-    delete_snapshot(platform, snapshot_name)
-    try:
-        st.cache_data.clear()
-    except:
-        pass
+    """Thin wrapper — delegates to the shared delete in app.py.
+    Returns (ok, error)."""
+    ok, err = delete_snapshot(platform, snapshot_name)
+    if ok:
+        try:
+            st.cache_data.clear()
+        except:
+            pass
+    return ok, err
 
 
 def _save_uploaded_file(platform, uploaded_file):
@@ -266,10 +269,14 @@ def _save_uploaded_file(platform, uploaded_file):
         uploaded_file.seek(0)
         save_tiger_snapshot(uploaded_file)
 
+    elif platform == "TigerPDF":
+        uploaded_file.seek(0)
+        from tiger_pdf import save_snapshot_and_history as save_tigerpdf_snapshot
+        save_tigerpdf_snapshot(uploaded_file)
+
     elif platform == "Moomoo":
         uploaded_file.seek(0)
         save_moomoo_snapshot(uploaded_file)
-
 
 # ============================================================
 # UPLOAD STATEMENTS (auto-process, no button — like Overview)
@@ -285,11 +292,11 @@ if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 0
 
 uploaded_files = st.file_uploader(
-    "Upload statement CSV files",
-    type=["csv"],
+    "Upload statement files",
+    type=["csv", "pdf"],
     accept_multiple_files=True,
     key=f"stmt_uploader_{st.session_state['uploader_key']}",
-    help="IBKR, Tiger and Moomoo CSV statements are supported. Files are processed automatically."
+    help="IBKR, Tiger, Moomoo CSV + Tiger PDF (mobile/web) are supported. Files are processed automatically."
 )
 
 if uploaded_files:
@@ -302,12 +309,15 @@ if uploaded_files:
         raw = uploaded_file.getvalue()
         platform = detect_platform(raw)
 
-        if platform not in ("IBKR", "Tiger", "Moomoo"):
+        if platform not in ("IBKR", "Tiger", "TigerPDF", "Moomoo"):
             results.append((uploaded_file.name, "error", "Unsupported statement format"))
             continue
 
+        # TigerPDF saves rows as "Tiger" — normalize for history/overlap/delete
+        hist_platform = "Tiger" if platform == "TigerPDF" else platform
+
         # Snapshot list BEFORE saving — used for duplicate/overlap detection
-        before = _existing_snapshot_files(platform)
+        before = _existing_snapshot_files(hist_platform)
 
         try:
             _save_uploaded_file(platform, uploaded_file)
@@ -315,7 +325,7 @@ if uploaded_files:
             results.append((uploaded_file.name, "error", f"{platform} · {str(e)}"))
             continue
 
-        after = _existing_snapshot_files(platform)
+        after = _existing_snapshot_files(hist_platform)
         new_files = after - before
 
         if new_files:
@@ -326,7 +336,7 @@ if uploaded_files:
             overlap_with = _find_overlap(new_name, before)
 
             if overlap_with:
-                _delete_snapshot(platform, new_name)
+                _delete_snapshot(hist_platform, new_name)
                 results.append(
                     (uploaded_file.name, "overlap",
                      f"{platform} · range **{new_name}** overlaps existing "
@@ -518,12 +528,14 @@ def _confirm_delete_dialog(platform, snapshot_name):
     c1, c2 = st.columns(2)
 
     if c1.button("✅ Yes, Delete", type="primary", width="stretch"):
-        _delete_snapshot(platform, snapshot_name)
-        st.session_state.pop("_pending_delete_snapshot", None)
-        # Clear any stale "processed" message from a previous upload
-        st.session_state.pop("last_upload_results", None)
-        st.success("✅ Snapshot deleted.")
-        st.rerun()
+        ok, err = _delete_snapshot(platform, snapshot_name)
+        if ok:
+            st.session_state.pop("_pending_delete_snapshot", None)
+            st.session_state.pop("last_upload_results", None)
+            st.success("✅ Snapshot deleted.")
+            st.rerun()
+        else:
+            st.error(f"⛔ Delete failed — {err}")
 
     if c2.button("❌ Cancel", width="stretch"):
         st.session_state.pop("_pending_delete_snapshot", None)

@@ -790,8 +790,13 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
         file_obj.seek(0)
 
     new_trades = parse_trades(file_obj, usd_to_sgd=usd_to_sgd, snapshot_file=snapshot_file)
+    return merge_and_save_trades(new_trades, snapshot_file)
 
-    if new_trades.empty:
+
+def merge_and_save_trades(new_trades, snapshot_file=""):
+    """Shared merge: takes a parsed new_trades df (from CSV or PDF) and
+    merges it into trades_history.csv. Used by tiger.py and tiger_pdf.py."""
+    if new_trades is None or new_trades.empty:
         return load_trades_history()
 
     for col in UNIFIED_TRADES_COLS:
@@ -818,7 +823,6 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
         combined = combined[UNIFIED_TRADES_COLS]
 
         if "TradeDate" in combined.columns:
-            # ⭐ Parse DD/MM/YYYY as datetime just for sorting
             combined["_sort_date"] = pd.to_datetime(
                 combined["TradeDate"], format="%d/%m/%Y", errors="coerce"
             )
@@ -891,7 +895,6 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
     combined = combined[UNIFIED_TRADES_COLS]
 
     if "TradeDate" in combined.columns:
-        # ⭐ Parse DD/MM/YYYY as datetime just for sorting
         combined["_sort_date"] = pd.to_datetime(
             combined["TradeDate"], format="%d/%m/%Y", errors="coerce"
         )
@@ -904,7 +907,6 @@ def save_trades_history(file_obj, usd_to_sgd=None, snapshot_file=""):
     combined.to_csv(get_trades_history_file(), index=False)
 
     return load_trades_history()
-
 
 def load_trades_history():
     if not os.path.exists(get_trades_history_file()):
@@ -1149,15 +1151,17 @@ def load_latest_snapshot():
         except:
             pass
 
-    with open(snapshot_path, "rb") as f:
-        fake_upload = io.BytesIO(f.read())
-        fake_upload.name = snapshot_file
-
-        nav_data = extract_nav_cash_sgd(fake_upload)
-
-        fake_upload.seek(0)
-        df_positions = parse_tiger_csv(fake_upload, usd_to_sgd=usd_to_sgd)
-
+    if str(snapshot_file).lower().endswith(".pdf"):
+        # PDF snapshot — parse via tiger_pdf (lazy import avoids circular)
+        from tiger_pdf import load_positions_from_pdf
+        df_positions, nav_data = load_positions_from_pdf(snapshot_path, usd_to_sgd=usd_to_sgd)
+    else:
+        with open(snapshot_path, "rb") as f:
+            fake_upload = io.BytesIO(f.read())
+            fake_upload.name = snapshot_file
+            nav_data = extract_nav_cash_sgd(fake_upload)
+            fake_upload.seek(0)
+            df_positions = parse_tiger_csv(fake_upload, usd_to_sgd=usd_to_sgd)
     return {
         "df_positions": df_positions,
         "history_df": tiger_df,

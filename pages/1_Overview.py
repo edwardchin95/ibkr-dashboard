@@ -65,10 +65,10 @@ if "ov_uploader_key" not in st.session_state:
     st.session_state["ov_uploader_key"] = 0
 
 uploaded_file = st.sidebar.file_uploader(
-    "Upload statement CSV files",
-    type="csv",
+    "Upload statement files",
+    type=["csv", "pdf"],
     key=f"overview_upload_{st.session_state['ov_uploader_key']}",
-    help="IBKR, Tiger and Moomoo CSV statements are supported. Files are processed automatically."
+    help="IBKR, Tiger, Moomoo CSV + Tiger PDF are supported. Files are processed automatically."
 )
 
 platform_filter = st.sidebar.selectbox(
@@ -97,10 +97,13 @@ if uploaded_file is not None:
     raw = uploaded_file.getvalue()
     platform = detect_platform(raw)
 
-    if platform not in ("IBKR", "Tiger", "Moomoo"):
+    if platform not in ("IBKR", "Tiger", "TigerPDF", "Moomoo"):   # ⭐ added TigerPDF
         st.sidebar.error("❌ Unsupported format")
     else:
-        before = _existing_snapshot_files(platform)
+        # ⭐ TigerPDF rows are saved as "Tiger" — use this for history/overlap/delete
+        hist_platform = "Tiger" if platform == "TigerPDF" else platform
+
+        before = _existing_snapshot_files(hist_platform)          # ⭐ hist_platform
 
         if platform == "IBKR":
             uploaded_file.seek(0); nav, cash, _, _ = ibkr_extract_nav_cash(uploaded_file)
@@ -109,10 +112,14 @@ if uploaded_file is not None:
             uploaded_file.seek(0); ibkr_save_snapshot_and_history(uploaded_file, nav, cash, pnl, dep)
         elif platform == "Tiger":
             uploaded_file.seek(0); tiger_save_snapshot_and_history(uploaded_file)
+        elif platform == "TigerPDF":                              # ⭐ new branch
+            uploaded_file.seek(0)
+            from tiger_pdf import save_snapshot_and_history as tigerpdf_save
+            tigerpdf_save(uploaded_file)
         elif platform == "Moomoo":
             uploaded_file.seek(0); moomoo_save_snapshot_and_history(uploaded_file)
 
-        after = _existing_snapshot_files(platform)
+        after = _existing_snapshot_files(hist_platform)           # ⭐ hist_platform
         new_files = after - before
 
         if new_files:
@@ -121,7 +128,7 @@ if uploaded_file is not None:
 
             if overlap_with:
                 from app import delete_snapshot
-                delete_snapshot(platform, new_name)
+                delete_snapshot(hist_platform, new_name)          # ⭐ hist_platform
                 st.sidebar.warning(
                     f"⛔ {platform}: overlap rejected\n\n"
                     f"Overlaps existing range.\nSee Snapshot Manager."

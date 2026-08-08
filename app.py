@@ -607,13 +607,26 @@ def format_df(df, cols_2dp=None, cols_3dp=None, date_cols=None):
 # ============================================================
 def detect_platform(file_bytes):
     """
-    自动识别 CSV 来自哪个 broker。
-    Return: "IBKR" / "Tiger" / "Moomoo" / None
+    Auto-detect which broker/format the upload is.
+    Return: "IBKR" / "Tiger" / "TigerPDF" / "Moomoo" / None
     """
     if isinstance(file_bytes, str):
         file_bytes = file_bytes.encode("utf-8")
 
-    # ---- Moomoo 检测 ----
+    # ---- PDF detection (Tiger mobile/web PDF) ----
+    # PDF text is compressed, so we can't byte-match "Tiger Brokers" on raw
+    # bytes. Use pdfplumber (via tiger_pdf.detect_tiger_pdf) to read the text.
+    if file_bytes[:5].startswith(b"%PDF"):
+        try:
+            from tiger_pdf import detect_tiger_pdf
+            if detect_tiger_pdf(file_bytes):
+                return "TigerPDF"
+        except Exception:
+            pass
+        return None   # unknown / unreadable PDF
+
+
+    # ---- Moomoo ----
     if b"Moomoo Statement" in file_bytes:
         return "Moomoo"
 
@@ -630,37 +643,57 @@ def detect_platform(file_bytes):
 
 def delete_snapshot(platform, snapshot_name):
     """
-    Shared delete used by Overview sidebar + Snapshot Manager.
-    Removes the row from portfolio_history.csv, its rows from
-    trades_history.csv, and the physical snapshot file.
+    Shared delete used by Overview + Snapshot Manager.
+    Returns (ok: bool, error: str).
+
+    Safety:
+      1. Pre-checks both CSVs are writable (catches Excel/file locks locally).
+      2. Writes CSVs FIRST, deletes the physical file LAST — so a mid-way
+         failure never leaves an orphan row pointing at a missing file.
     """
-    # Remove from portfolio_history.csv
-    if os.path.exists(get_history_file()):
-        try:
-            hdf = pd.read_csv(get_history_file())
+    hist = get_history_file()
+    trades = get_trades_history_file()
+
+    # --- 1. Pre-check writability (catches "file open in Excel") ---
+    for path in [hist, trades]:
+        if os.path.exists(path):
+            try:
+                with open(path, "a"):
+                    pass
+            except PermissionError:
+                return (False,
+                        f"'{os.path.basename(path)}' is open in another program "
+                        f"(e.g. Excel). Close it and try again.")
+            except Exception as e:
+                return (False, f"Cannot access '{os.path.basename(path)}': {e}")
+
+    # --- 2. Update portfolio_history.csv ---
+    try:
+        if os.path.exists(hist):
+            hdf = pd.read_csv(hist)
             if not hdf.empty and "Platform" in hdf.columns and "SnapshotFile" in hdf.columns:
                 mask = ~(
                     (hdf["Platform"].astype(str) == platform)
                     & (hdf["SnapshotFile"].astype(str) == snapshot_name)
                 )
-                hdf[mask].to_csv(get_history_file(), index=False)
-        except:
-            pass
+                hdf[mask].to_csv(hist, index=False)
+    except Exception as e:
+        return (False, f"Failed to update portfolio_history.csv: {e}")
 
-    # Remove from trades_history.csv
-    if os.path.exists(get_trades_history_file()):
-        try:
-            tdf = pd.read_csv(get_trades_history_file(), dtype=str)
+    # --- 3. Update trades_history.csv ---
+    try:
+        if os.path.exists(trades):
+            tdf = pd.read_csv(trades, dtype=str)
             if not tdf.empty and "Platform" in tdf.columns and "SnapshotFile" in tdf.columns:
                 mask = ~(
                     (tdf["Platform"].astype(str) == platform)
                     & (tdf["SnapshotFile"].astype(str) == snapshot_name)
                 )
-                tdf[mask].to_csv(get_trades_history_file(), index=False)
-        except:
-            pass
+                tdf[mask].to_csv(trades, index=False)
+    except Exception as e:
+        return (False, f"Failed to update trades_history.csv: {e}")
 
-    # Remove physical snapshot file (lazy import to avoid circular import)
+    # --- 4. Delete the physical snapshot file LAST ---
     try:
         if platform == "IBKR":
             from ibkr import get_ibkr_snapshot_dir as _dirfn
@@ -675,8 +708,10 @@ def delete_snapshot(platform, snapshot_name):
             snap_path = os.path.join(_dirfn(), snapshot_name)
             if os.path.exists(snap_path):
                 os.remove(snap_path)
-    except:
-        pass
+    except Exception as e:
+        return (False, f"History updated, but couldn't remove file: {e}")
+
+    return (True, "")
 
 def _existing_snapshot_files(platform):
     if not os.path.exists(get_history_file()):

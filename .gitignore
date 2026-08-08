@@ -8,6 +8,7 @@ venv/
 env/
 app.cpython-313.pyc
 ibkr.cpython-313.pyc
+app.cpython-313.pyc
 # Streamlit
 .streamlit/secrets.toml
 .streamlit/secrets.toml2

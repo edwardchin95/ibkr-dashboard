@@ -591,14 +591,13 @@ def load_latest_snapshot():
         return m.group(1) if m else "00000000"
 
     ibkr_df = ibkr_df.copy()
-    ibkr_df["_sort_key"] = ibkr_df["SnapshotFile"].apply(_extract_end_date)
-    ibkr_df = ibkr_df.sort_values("_sort_key").drop(columns=["_sort_key"])
+    ibkr_df["_sort"] = ibkr_df["SnapshotFile"].apply(_extract_end_date)
+    ibkr_df = ibkr_df.sort_values("_sort").drop(columns=["_sort"])
 
     latest = ibkr_df.iloc[-1]
     snapshot_file = latest["SnapshotFile"]
 
-    # ⭐ New location (/ibkr subfolder); fall back to old base dir for
-    # legacy files saved before the subfolder switch.
+    # New location (/ibkr subfolder); fall back to old base dir for legacy files.
     snapshot_path = os.path.join(get_ibkr_snapshot_dir(), snapshot_file)
     if not os.path.exists(snapshot_path):
         legacy = os.path.join(get_snapshot_dir(), snapshot_file)
@@ -629,7 +628,6 @@ def load_latest_snapshot():
         "other": _safe_float(latest.get("TotalOther", 0), 0),
         "platform": "IBKR",
     }
-
 
 # ============================================================
 # PROCESS INCOMING

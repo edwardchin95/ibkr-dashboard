@@ -638,9 +638,11 @@ def _compute_campaign(group_name, trades_df, journal_df):
         })
 
     matching_notes.sort(key=lambda x: _to_dt(x["date"]), reverse=True)
+    latest_be_date = ""
     for note in matching_notes:
         if note["breakeven"]:
             latest_be = note["breakeven"]
+            latest_be_date = note["date"]
             break
 
     timeline = []
@@ -773,6 +775,8 @@ def _compute_campaign(group_name, trades_df, journal_df):
         "realized": realized,
         "open_positions": open_positions,
         "latest_be": latest_be,
+        "latest_be_date": latest_be_date,
+        "latest_trade_date": _max_date(trade_dates),
         "n_trades": int(len(gt)) if not gt.empty else 0,
         "n_notes": len(matching_notes),
         "start_date": start_date,
@@ -832,27 +836,50 @@ def _enrich_with_linkage(campaigns):
         c["open_children"] = n_open
         c["adjusted_cost"] = c["net_cash"] + harvested
 
-        # ---- Pos BE only when it is unambiguous ----
-        # Rule: single-anchor parent (LEAP/HOLD/STOCK/SHARES) with EXACTLY ONE open leg.
-        # More than one open leg => multi-leg structure (synthetic after partial close,
-        # collar, etc.) => we CANNOT express one BE point, so defer to manual BE.
-        last_seg = _last_strategy_segment(c["group"])
-        if last_seg in BE_ELIGIBLE_PARENT and len(c["open_positions"]) == 1:
+    # ---- Position BE: auto (Pos BE) vs manual (Manual BE); recency decides ----
+    for c in campaigns:
+        c["position_be"] = None          # auto numeric
+        c["position_be_manual"] = None   # manual string
+        c["be_tooltip"] = ""
+
+        # Auto BE — single open leg, whitelisted strategy, NEVER on cycles.
+        auto_be = None
+        if not c["is_cycle"] and len(c["open_positions"]) == 1:
+            last_seg = _last_strategy_segment(c["group"])
             fp = c["open_positions"][0]
-            asset_class = fp.get("asset_class", "").upper()
-            n_units = abs(fp.get("quantity", 1))
-            if n_units > 0:
-                if asset_class == "OPT":
+            ac = str(fp.get("asset_class", "")).upper()
+            n = abs(fp.get("quantity", 0))
+            if n > 0:
+                if last_seg in ("STOCK", "SHARES", "HOLD") and ac == "STK":
+                    auto_be = abs(c["adjusted_cost"]) / n
+                elif last_seg in ("LEAP", "LEAPS") and ac == "OPT":
                     strike = _extract_strike_from_description(fp.get("description", ""))
                     if strike is not None:
-                        # BE assuming you EXERCISE the long option (LEAP). Most people SELL,
-                        # so this is labelled honestly as "if exercised".
-                        c["position_be"] = strike + abs(c["adjusted_cost"]) / (100 * n_units)
-                        c["position_be_label"] = "BE (if exercised)"
-                elif asset_class == "STK":
-                    c["position_be"] = abs(c["adjusted_cost"]) / n_units
-                    c["position_be_label"] = "Pos BE"
+                        auto_be = strike + abs(c["adjusted_cost"]) / (100 * n)
+                        c["be_tooltip"] = "Assumes you exercise the long option"
+                elif last_seg in ("SP", "CSP") and ac == "OPT":
+                    strike = _extract_strike_from_description(fp.get("description", ""))
+                    if strike is not None:
+                        auto_be = strike - c["net_cash"] / (100 * n)
 
+        manual_be = c.get("latest_be", "")
+        manual_date = c.get("latest_be_date", "")
+        trade_date = c.get("latest_trade_date", "")
+
+        def _d(s):
+            return _to_dt(s) if s else datetime.min
+
+        if auto_be is not None and manual_be:
+            # Trade must be STRICTLY later than the manual note to win (rule 3).
+            # Manual wins ties / when later (rule 2).
+            if _d(trade_date) > _d(manual_date):
+                c["position_be"] = auto_be
+            else:
+                c["position_be_manual"] = manual_be
+        elif auto_be is not None:
+            c["position_be"] = auto_be
+        elif manual_be:
+            c["position_be_manual"] = manual_be
 
 # ============================================================
 # CARD RENDERING (black card, actions inside, mobile-friendly)
@@ -900,16 +927,25 @@ def _metrics_html(c):
         else:
             raw_color = "#66FF99" if c["net_cash"] >= 0 else "#FF6666"
             tiles.append(_metric("Cost", f"<span style='color:{raw_color};'>{_money(c['net_cash'])}</span>"))
-        if c["position_be"] is not None:
-            tiles.append(_metric(c.get("position_be_label", "Pos BE"),
-                                 f"<span style='color:#FFC300;'>&#36;{c['position_be']:.2f}</span>"))
-        elif c["latest_be"]:
-            tiles.append(_metric("BE (manual)", f"<span style='color:#FFC300;'>{_safe_html(c['latest_be'])}</span>"))
+        if c.get("position_be") is not None:
+            _tip = c.get("be_tooltip", "")
+            _t = f" title=\"{_safe_html(_tip)}\"" if _tip else ""
+            tiles.append(_metric("Pos BE",
+                f"<span style='color:#FFC300;'{_t}>${c['position_be']:.2f}</span>"))
+        elif c.get("position_be_manual"):
+            tiles.append(_metric("Manual BE",
+                f"<span style='color:#FFC300;'>{_safe_html(c['position_be_manual'])}</span>"))
     else:
         net_color = "#66FF99" if c["net_cash"] >= 0 else "#FF6666"
         tiles.append(_metric("Net Prem", f"<span style='color:{net_color};'>{_money(c['net_cash'])}</span>"))
-        if c["latest_be"]:
-            tiles.append(_metric("BE (manual)", f"<span style='color:#FFC300;'>{_safe_html(c['latest_be'])}</span>"))
+        if c.get("position_be") is not None:
+            _tip = c.get("be_tooltip", "")
+            _t = f" title=\"{_safe_html(_tip)}\"" if _tip else ""
+            tiles.append(_metric("Pos BE",
+                f"<span style='color:#FFC300;'{_t}>${c['position_be']:.2f}</span>"))
+        elif c.get("position_be_manual"):
+            tiles.append(_metric("Manual BE",
+                f"<span style='color:#FFC300;'>{_safe_html(c['position_be_manual'])}</span>"))
         if abs(c["realized"]) > 0.01:
             rc = "#66FF99" if c["realized"] >= 0 else "#FF6666"
             rlabel = "Final PnL" if not c["is_open"] else "Realized"
@@ -1196,32 +1232,40 @@ def _render_naming_help():
 - **Raw Cost** = parent's own net cash.
 - **Harvested** = sum of **closed** nested cycles' net cash.
 - **Adj Cost** = Raw Cost + Harvested. Updates every time a cycle closes.
-- **Pos BE** — shown ONLY when unambiguous (see below).
+- **Pos BE** — auto for single-leg (stock, LEAP, SP/CSP). Recency picks Pos BE vs Manual BE (see below).
 
 You do **not** journal Adj Cost or premium collected. Nest cycles correctly and close them; the numbers appear.
 
 ---
 
-## 📏 Pos BE — shown only when unambiguous
+## 📏 Pos BE — auto-computed for single-leg positions
 
-**Auto BE appears** for a single-anchor parent (**LEAP / HOLD / STOCK / SHARES**) with **exactly ONE open leg**:
-- Stock parent → `Pos BE = |Adj Cost| / shares`
-- Option parent → `BE (if exercised) = strike + |Adj Cost| / (100 × contracts)` — reference basis, not your exit price.
+**Pos BE (auto)** appears when a campaign has **exactly ONE open leg**:
+- **STOCK / SHARES / HOLD** → `|Adj Cost| / shares`
+- **LEAP / LEAPS** → `strike + |Adj Cost| / (100 × contracts)` (assumes exercise — hover the value to see)
+- **SP / CSP** → `strike − Net Premium / (100 × contracts)`
 
-**Auto BE is hidden** (defers to your typed BE) for anything multi-leg: synthetics after partial close, collars, spreads, straddles, strangles, ICs, ZEBRAs. A single BE point can't represent those — some have two breakevens or a curve.
+Rolls update it automatically — collecting more credit lowers a short-put BE.
 
-Rule of thumb: **auto BE where provably correct, manual BE everywhere else, never a fake number.**
+**No auto BE** (uses Manual BE) for multi-leg: **SYN, VERT, SPREAD, STRADDLE, STRANGLE, IC**, collars, calendars. **Cycles never show Pos BE** — the parent owns the basis.
+
+**Pos BE vs Manual BE — recency wins:**
+- Latest **trade** newer than latest BE note → **Pos BE** shows.
+- BE **note** same-day or newer than last trade → **Manual BE** overrides.
+- Only notes with a **filled Breakeven field** count.
 
 ---
 
 ## ✍️ When to type BE manually (in the Breakeven field of a note)
 
-1. **Multi-leg structure** — spread, IC, straddle, synthetic-after-partial-close, ZEBRA, collar. The engine can't compute; you're the source of truth.
-2. **LEAP you plan to SELL, not exercise** — auto shows "BE if exercised". If your real exit is a sell price, type that as BE with reasoning.
-3. **Broker missed an assignment or stock leg** — Adj Cost is wrong until data is fixed. Override with a manual BE anchoring the truth.
+1. **Multi-leg** — spread, IC, straddle, SYN, ZEBRA, collar. The engine can't reduce these to one number.
+2. **LEAP you plan to SELL, not exercise** — auto Pos BE assumes exercise; journal your real exit.
+3. **Broker missed an assignment / stock leg** — Adj Cost / Net Premium is wrong until data is fixed; override with the truth.
 4. **Trading-plan BE, not math BE** — a mental stop / risk limit is your real BE regardless of math. Journal it.
 
-For a normal wheel / PMCC / single-leg SP, the auto number is trustworthy. Don't retype it.
+⚠️ A manual BE is overridden the moment a **newer trade** appears on the campaign. If you journal a BE then roll the same day, the trade wins — delete or re-date the note to keep the manual number.
+
+For a normal wheel / PMCC / single-leg SP / LEAP, the auto Pos BE is trustworthy. Don't retype it.
 
 ---
 
@@ -1285,6 +1329,7 @@ New way: `SOFI-LEAP-1-PMCC-2` — done.
 
 </div>
 """, unsafe_allow_html=True)
+
 
 
 # ============================================================
